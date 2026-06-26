@@ -1,0 +1,15 @@
+# Secrets
+.env
+
+# Environments
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local data & outputs (optional, but recommended so you don't upload client data)
+cache/
+outputs/
+samples/
