@@ -686,15 +686,26 @@ elif st.session_state.step == 4:
         unsafe_allow_html=True,
     )
 
+    # Adjust the Missing counts to reflect TDS-reclassified rows — keeps the
+    # KPI tiles consistent with both the Excel report's Summary sheet and the
+    # individual exception tables below.
+    tds_result_pre = st.session_state.get("tds_result")
+    tds_removed_theirs = len(tds_result_pre.removed_from_missing_theirs) if tds_result_pre else 0
+    tds_removed_ours   = len(tds_result_pre.removed_from_missing_ours)   if tds_result_pre else 0
+    adj_missing_theirs = s["missing_in_theirs"] - tds_removed_theirs
+    adj_missing_ours   = s["missing_in_ours"]   - tds_removed_ours
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("L1 Matches", s["matched_l1"], help="Date + Ref + Amount all align")
     c2.metric("L2 Matches (Timing)", s["matched_l2"])
     c3.metric("Amount Mismatches", s["amount_mismatches"])
-    c4.metric("Missing in Theirs", s["missing_in_theirs"], help="In our books but not in theirs")
+    c4.metric("Missing in Theirs", adj_missing_theirs,
+              help="In our books but not in theirs (TDS journal entries excluded — see TDS Reconciliation)")
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("L3 Matches (Review)", s["matched_l3"])
-    c6.metric("Missing in Ours", s["missing_in_ours"])
+    c6.metric("Missing in Ours", adj_missing_ours,
+              help="In their books but not in ours (TDS journal entries excluded — see TDS Reconciliation)")
     c7.metric("Our Records", s["total_our_records"])
     c8.metric("Their Records", s["total_their_records"])
 
