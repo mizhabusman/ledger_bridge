@@ -65,7 +65,7 @@ DEFAULT_AMOUNT_TOLERANCE = 1.00
 DEFAULT_DATE_TOLERANCE_DAYS = 180
 
 # Claude model
-CLAUDE_MODEL = "claude-haiku-4-5"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Sample rows sent to Claude during mapping
 MAPPING_SAMPLE_ROWS = 8
