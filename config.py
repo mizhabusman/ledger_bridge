@@ -5,14 +5,14 @@ Defines the canonical schema, settings, and constants used across the app.
 """
 
 # The 9-field canonical schema for OUTPUT (final standardized ledger format).
-# Note: Gross Amount is COMPUTED from Debit/Credit + role, not directly mapped.
+# Note: Gross Amount is COMPUTED as Debit - Credit, not directly mapped.
 CANONICAL_FIELDS = [
     "Date",
     "Voucher Type",
     "Voucher No",
     "Invoice Ref",
     "Description",
-    "Gross Amount",     # computed = signed amount based on role
+    "Gross Amount",     # computed = Debit - Credit
     "TDS Amount",
     "Notes",
     "Rec Code",
@@ -43,9 +43,6 @@ OPTIONAL_FIELDS = [
     "TDS Amount",
 ]
 
-# Role of a ledger: are we looking at the buyer's books or the seller's books?
-ROLES = ["buyer", "seller"]
-
 # Reconciliation codes written into the Rec Code column
 REC_CODES = {
     "L1": "MATCHED_L1",
@@ -65,7 +62,7 @@ DEFAULT_AMOUNT_TOLERANCE = 1.00
 DEFAULT_DATE_TOLERANCE_DAYS = 45
 
 # Claude model.
-# Mapping + role detection is a small structured task (8 sample rows in, a small
+# Column mapping is a small structured task (8 sample rows in, a small
 # JSON out), so Haiku is the right cost/quality fit. Bump to claude-sonnet-4-6
 # if you want richer AI insights prose.
 CLAUDE_MODEL = "claude-haiku-4-5"

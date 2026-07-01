@@ -1,11 +1,12 @@
 """
 LedgerBridge AI — Claude Mapping Engine
 
-Sends column names + sample rows to Claude, gets back:
-1. A mapping from source columns to canonical mappable fields (incl. Debit and Credit)
-2. A detected role: "buyer" or "seller"
+Sends column names + sample rows to Claude, gets back a mapping from source
+columns to canonical mappable fields (incl. Debit and Credit).
 
-The user reviews/edits both on the confirmation screen.
+The user reviews/edits the mapping on the confirmation screen. There is no
+buyer/seller role: Gross Amount is Debit - Credit uniformly for every ledger
+(see standardize.py).
 """
 
 from __future__ import annotations
@@ -27,13 +28,11 @@ from ingest import get_column_fingerprint
 
 
 SYSTEM_PROMPT = """You are a finance data expert specialising in Indian accounting systems.
-Your task is to analyze a raw accounting ledger export and return TWO things:
-
-1. A mapping from source columns to canonical fields
-2. The detected ROLE of this ledger: "buyer" or "seller"
+Your task is to analyze a raw accounting ledger export and return a mapping
+from source columns to canonical fields.
 
 ═════════════════════════════════════════════════════════
-PART 1: COLUMN MAPPING
+COLUMN MAPPING
 ═════════════════════════════════════════════════════════
 
 Map source columns to these canonical fields:
@@ -50,30 +49,8 @@ Map source columns to these canonical fields:
 CRITICAL RULES for Debit/Credit:
 - ALWAYS map Debit and Credit as SEPARATE columns. Never combine them.
 - Most ledgers have explicit "Debit" and "Credit" columns. Find them by name.
-- If the ledger has only a single signed "Amount" column with positives and negatives, map it to Debit and leave Credit null. The sign convention will be handled by the role.
+- If the ledger has only a single signed "Amount" column with positives and negatives, map it to Debit and leave Credit null.
 - NEVER map a Net-Amount, Transaction-Amount, or Balance column to Debit or Credit. Those are derived values.
-
-═════════════════════════════════════════════════════════
-PART 2: ROLE DETECTION
-═════════════════════════════════════════════════════════
-
-Determine whether this ledger is from:
-
-- "buyer" — the BUYER's view of the relationship (the vendor/supplier is the counterparty).
-  Signals:
-    * Voucher Type contains "Purchase", "Bank-Payment", "BP", "Payment Voucher", "G.Journal" (in a vendor ledger)
-    * Description has "Payment to vendor", "GST Vr. Payments / Purchase"
-    * Invoice amounts sit in the Credit column (AP increases)
-    * Payment amounts sit in the Debit column (AP decreases)
-
-- "seller" — the SELLER's view of the relationship (the customer is the counterparty).
-  Signals:
-    * Voucher Type contains "Sales", "SV" (Sales Voucher), "Bank Receipt", "BR", "Receipt", "Credit Note"
-    * Description has "Sales", "Bill raised", "Invoice raised"
-    * Invoice amounts sit in the Debit column (AR increases)
-    * Payment/receipt amounts sit in the Credit column (AR decreases)
-
-Use whatever signals are clearest. If genuinely uncertain, prefer "buyer" and mark confidence "low".
 
 ═════════════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -82,9 +59,6 @@ OUTPUT FORMAT
 Return ONLY valid JSON, no markdown fences, no commentary:
 
 {
-  "role": "buyer" | "seller",
-  "role_confidence": "high" | "medium" | "low",
-  "role_reasoning": "one short sentence explaining the signals you used",
   "mapping": {
     "Date":         {"source": "<column or null>", "confidence": "high|medium|low|n/a"},
     "Voucher Type": {"source": "<column or null>", "confidence": "..."},
@@ -112,7 +86,7 @@ def _build_user_prompt(df: pd.DataFrame) -> str:
 Sample rows ({len(sample)} shown):
 {chr(10).join(rows)}
 
-Analyze this ledger. Return JSON only with role + mapping."""
+Analyze this ledger. Return JSON only with the mapping."""
 
 
 def analyze_ledger(
@@ -123,13 +97,10 @@ def analyze_ledger(
     step_name: str = "Map Ledger",
 ) -> dict:
     """
-    Use Claude to detect the role + map columns.
+    Use Claude to map source columns to canonical fields.
 
     Returns:
         {
-          "role": "buyer" | "seller",
-          "role_confidence": "...",
-          "role_reasoning": "...",
           "mapping": { canonical_field: {source, confidence}, ... }
         }
 
@@ -173,12 +144,6 @@ def analyze_ledger(
         if field not in mapping or not isinstance(mapping[field], dict):
             mapping[field] = {"source": None, "confidence": "n/a"}
     result["mapping"] = mapping
-
-    # Ensure role is valid
-    if result.get("role") not in ("buyer", "seller"):
-        result["role"] = "buyer"
-        result["role_confidence"] = "low"
-        result["role_reasoning"] = "default (could not determine from data)"
 
     # Cache the freshly computed analysis so identical formats skip the API
     if use_cache:
@@ -224,7 +189,7 @@ def _parse_analysis_json(raw_text: str) -> dict:
 
 
 def save_confirmed_analysis(df: pd.DataFrame, analysis: dict) -> None:
-    """Persist user-confirmed role + mapping so the same format skips the API next time."""
+    """Persist the user-confirmed mapping so the same format skips the API next time."""
     _write_cache(get_column_fingerprint(df), analysis)
 
 

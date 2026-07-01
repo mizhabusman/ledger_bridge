@@ -157,9 +157,9 @@ def _write_summary(wb: Workbook, result: ReconciliationResult, ai_insights: str,
         ("+ Sum of their transactions",     s["sum_their_transactions"]),
         ("= Closing Balance (Theirs)",      s["closing_balance_theirs"]),
         ("",                                 None),
-        ("Difference (Ours − Theirs)",      s["difference"]),
-        ("Reconciling items (one-sided)",   s["reconciling_item"]),
-        ("Residual (should be 0)",          s["residual"]),
+        ("Net Position (Ours + Theirs, should be ~0)", s["difference"]),
+        ("Reconciling items (missing + mismatches)",   s["reconciling_item"]),
+        ("Residual (should be 0)",                     s["residual"]),
     ]
     for label, val in walk:
         ws.cell(row=row, column=1, value=label)

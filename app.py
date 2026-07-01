@@ -3,7 +3,7 @@ LedgerBridge AI — Streamlit Web App
 
 User flow:
   1. Upload two ledger files
-  2. AI proposes ROLE (buyer/seller) + column mappings → user reviews/confirms
+  2. AI proposes column mappings → user reviews/confirms
   3. Enter opening balances
   4. Process & download reports
 
@@ -22,7 +22,7 @@ import streamlit as st
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from config import MAPPABLE_FIELDS, ROLES, DEFAULT_AMOUNT_TOLERANCE
+from config import MAPPABLE_FIELDS, DEFAULT_AMOUNT_TOLERANCE
 from ingest import load_ledger, list_sheets
 from mapper import analyze_ledger, save_confirmed_analysis
 from standardize import standardize
@@ -421,7 +421,7 @@ if st.session_state.step == 1:
 
         st.markdown('<div class="lb-spacer-md"></div>', unsafe_allow_html=True)
         if st.button("Analyze →", type="primary", use_container_width=True):
-            with st.spinner("Reading files and asking Claude to detect role + map columns..."):
+            with st.spinner("Reading files and asking Claude to map columns..."):
                 our_path = save_uploaded_file(our_file)
                 their_path = save_uploaded_file(their_file)
 
@@ -449,31 +449,19 @@ if st.session_state.step == 1:
                     cost_tracker=tracker, step_name="Map Their Ledger",
                 )
 
-                from standardize import detect_role_from_data
-                for analysis_key, df_key in [("our_analysis", "our_df"), ("their_analysis", "their_df")]:
-                    a = st.session_state[analysis_key]
-                    if a.get("role_confidence") in ("low", "n/a", None):
-                        role, reason = detect_role_from_data(
-                            st.session_state[df_key], a.get("mapping", {})
-                        )
-                        a["role"] = role
-                        a["role_confidence"] = "medium"
-                        a["role_reasoning"] = f"rule-based: {reason}"
-                        st.session_state[analysis_key] = a
-
                 st.session_state.step = 2
                 st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STEP 2 — Confirm role + mappings
+# STEP 2 — Confirm mappings
 # ═══════════════════════════════════════════════════════════════════════════
 elif st.session_state.step == 2:
-    st.markdown("## Step 2 — Confirm Role & Column Mappings")
+    st.markdown("## Step 2 — Confirm Column Mappings")
     st.markdown(
         '<p style="color:#6B7280; margin-top:-4px; margin-bottom:8px;">'
-        '<strong>Role</strong> determines how Gross Amount is computed from Debit/Credit. '
         '<strong>Mappings</strong> tell the engine which column means what. '
+        'Gross Amount is always computed as Debit − Credit. '
         'This is the critical accuracy step — review carefully before confirming.'
         '</p>',
         unsafe_allow_html=True,
@@ -487,28 +475,6 @@ elif st.session_state.step == 2:
             f'{", ".join(list(df.columns)[:6])}{"..." if len(df.columns) > 6 else ""}</div>',
             unsafe_allow_html=True,
         )
-
-        current_role = analysis.get("role", "buyer")
-        role_conf = analysis.get("role_confidence", "n/a")
-        role_reason = analysis.get("role_reasoning", "")
-
-        st.markdown(
-            f'<div style="margin-bottom:6px;">'
-            f'<strong style="color:#1F3A6B;">Role</strong> &nbsp; {conf_badge(role_conf)}'
-            f'</div>'
-            f'<div style="font-size:12px; color:#6B7280; margin-bottom:8px; font-style:italic;">{role_reason}</div>',
-            unsafe_allow_html=True,
-        )
-        new_role = st.radio(
-            f"{label} role",
-            ROLES,
-            index=ROLES.index(current_role) if current_role in ROLES else 0,
-            horizontal=True,
-            key=f"{label}_role",
-            label_visibility="collapsed",
-        )
-
-        st.markdown('<hr style="margin:18px 0;">', unsafe_allow_html=True)
         st.markdown('<div style="font-weight:600; color:#1F3A6B; margin-bottom:10px;">Column mappings</div>', unsafe_allow_html=True)
 
         mapping = analysis.get("mapping", {})
@@ -543,9 +509,6 @@ elif st.session_state.step == 2:
             )
 
         return {
-            "role": new_role,
-            "role_confidence": role_conf,
-            "role_reasoning": role_reason,
             "mapping": new_mapping,
         }
 
@@ -585,6 +548,15 @@ elif st.session_state.step == 3:
         unsafe_allow_html=True,
     )
 
+    st.markdown(
+        '<p style="color:#6B7280; margin-top:-16px; margin-bottom:8px; font-size:12px; font-style:italic;">'
+        'Gross Amount follows Debit = positive, Credit = negative on both ledgers, so the same real '
+        'transaction is opposite-signed on each side. Enter opening balances the same way — Party A\'s '
+        'opening receivable and Party B\'s opening payable for this relationship should numerically cancel '
+        '(e.g. +50,000 and −50,000), not both be entered as the same sign.'
+        '</p>',
+        unsafe_allow_html=True,
+    )
     c1, c2 = st.columns(2, gap="large")
     with c1:
         opening_ours = st.number_input("Opening balance (Our books)", value=0.0, step=1000.0, format="%.2f")
@@ -617,8 +589,8 @@ elif st.session_state.step == 3:
                 our_a = st.session_state.our_analysis
                 their_a = st.session_state.their_analysis
 
-                ours_std = standardize(st.session_state.our_df, our_a["mapping"], role=our_a["role"])
-                theirs_std = standardize(st.session_state.their_df, their_a["mapping"], role=their_a["role"])
+                ours_std = standardize(st.session_state.our_df, our_a["mapping"])
+                theirs_std = standardize(st.session_state.their_df, their_a["mapping"])
 
                 result = reconcile(
                     ours_std, theirs_std,
@@ -682,16 +654,6 @@ elif st.session_state.step == 4:
     result = st.session_state.result
     s = result.summary
 
-    or_ = st.session_state.our_analysis
-    tr_ = st.session_state.their_analysis
-    st.markdown(
-        f'<p style="color:#6B7280; margin-top:-4px; margin-bottom:18px; font-size:13px;">'
-        f'Roles used: Our ledger = <strong style="color:#1F3A6B;">{or_["role"]}</strong> · '
-        f'Their ledger = <strong style="color:#1F3A6B;">{tr_["role"]}</strong>'
-        f'</p>',
-        unsafe_allow_html=True,
-    )
-
     # Adjust the Missing counts to reflect TDS-reclassified rows — keeps the
     # KPI tiles consistent with both the Excel report's Summary sheet and the
     # individual exception tables below.
@@ -735,7 +697,8 @@ elif st.session_state.step == 4:
         st.dataframe(walk.style.format({"Ours (₹)": "{:,.2f}", "Theirs (₹)": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
         cb1, cb2, cb3 = st.columns(3)
-        cb1.metric("Difference (Ours − Theirs)", f"₹{s['difference']:,.2f}")
+        cb1.metric("Net Position (Ours + Theirs)", f"₹{s['difference']:,.2f}",
+                   help="Should be ~0: the two ledgers are opposite-signed mirrors of the same transactions.")
         cb2.metric("Reconciling items", f"₹{s['reconciling_item']:,.2f}")
         cb3.metric("Residual", f"₹{s['residual']:,.2f}")
 

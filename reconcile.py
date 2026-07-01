@@ -3,6 +3,14 @@ LedgerBridge AI — Core Reconciliation Engine
 
 Performs a deterministic, multi-pass match between two standardized ledgers.
 Strictly relies on Pandas for 100% mathematical accuracy.
+
+Gross Amount is Debit - Credit on BOTH ledgers uniformly (standardize.py has
+no buyer/seller distinction). Because the two parties are double-entry
+counterparties, the SAME real transaction lands with OPPOSITE signs on the
+two ledgers (one party's receivable is the other's payable). Every match
+predicate and balance formula below therefore checks "ours + theirs ~ 0"
+(mirror-sign, cancels out), not "ours - theirs ~ 0" (same-sign, equal) as a
+role-normalized engine would.
 """
 
 from dataclasses import dataclass
@@ -139,7 +147,7 @@ def reconcile(
                 continue
             if not (o_date[i] == t_date[c]):              # NaT-safe date equality
                 continue
-            if abs(t_amt[c] - o_amt[i]) > amount_tolerance:
+            if abs(t_amt[c] + o_amt[i]) > amount_tolerance:  # mirror-sign: cancels to ~0
                 continue
             if occ_l1_t[c] != occ_l1_o[i]:
                 continue
@@ -156,7 +164,7 @@ def reconcile(
         for c in grp_r.get(r, ()):
             if t_match[c] != -1:
                 continue
-            if abs(t_amt[c] - o_amt[i]) > amount_tolerance:
+            if abs(t_amt[c] + o_amt[i]) > amount_tolerance:  # mirror-sign: cancels to ~0
                 continue
             if occ_l2_t[c] != occ_l2_o[i]:
                 continue
@@ -173,13 +181,14 @@ def reconcile(
         r = o_ref[i]
         if not _has_ref(r):
             continue
-        # Pair the duplicated ref with the CLOSEST-amount candidate (ties → first
-        # by row order, matching .abs().idxmin()).
+        # Pair the duplicated ref with the CLOSEST-to-cancelling candidate (the
+        # theirs amount whose negation is closest to ours — mirror-sign, not
+        # closest-to-equal), ties → first by row order, matching .abs().idxmin().
         best_c, best_diff = -1, None
         for c in grp_r.get(r, ()):
             if t_match[c] != -1:
                 continue
-            d = abs(t_amt[c] - o_amt[i])
+            d = abs(t_amt[c] + o_amt[i])
             if best_diff is None or d < best_diff:
                 best_diff, best_c = d, c
         if best_c != -1:
@@ -203,7 +212,7 @@ def reconcile(
                 continue
             if not (o_date[i] == t_date[c]):
                 continue
-            if abs(t_amt[c] - o_amt[i]) > amount_tolerance:
+            if abs(t_amt[c] + o_amt[i]) > amount_tolerance:  # mirror-sign: cancels to ~0
                 continue
             n_cand += 1
             if n_cand > 1:
@@ -221,7 +230,7 @@ def reconcile(
                 continue
             if not (o_date[k] == t_date[cand]):
                 continue
-            if abs(o_amt[k] - their_amt) > amount_tolerance:
+            if abs(o_amt[k] + their_amt) > amount_tolerance:  # mirror-sign: cancels to ~0
                 continue
             rev += 1
             if rev > 1:
@@ -253,21 +262,33 @@ def reconcile(
     theirs["Rec Code"] = theirs["_rec_code"]
 
     # ---------------- CALCULATE METRICS ----------------
+    # Mirror-sign convention: a perfectly matched pair satisfies ours + theirs
+    # ~ 0 (opposite sign, equal magnitude), so the balance check is a SUM, not
+    # a difference. This requires opening_balance_ours/opening_balance_theirs
+    # to also be entered under the same mirror-sign convention (Party A's
+    # opening receivable and Party B's opening payable for the same
+    # relationship should numerically cancel) — see the opening-balance help
+    # text in app.py.
     sum_ours = ours["Gross Amount"].sum()
     sum_theirs = theirs["Gross Amount"].sum()
     cb_ours = opening_balance_ours + sum_ours
     cb_theirs = opening_balance_theirs + sum_theirs
-    diff = cb_ours - cb_theirs
+    diff = cb_ours + cb_theirs
 
-    # Reconciling items = (Missing in Theirs) - (Missing in Ours) + (Amount Mismatches diff)
+    # Reconciling items, re-derived for the mirror-sign convention:
+    #   - Missing rows are one-sided (no counterpart to cancel against), so
+    #     each keeps its own sign unchanged.
+    #   - Amount-mismatch pairs are two-sided: the expected relationship is
+    #     ours_amt + theirs_amt ~ 0, so a mismatched pair's contribution to
+    #     the unexplained gap is the SUM (not the difference) of the two.
     missing_theirs_sum = ours[ours["_rec_code"] == REC_CODES["MISSING_THEIRS"]]["Gross Amount"].sum()
     missing_ours_sum = theirs[theirs["_rec_code"] == REC_CODES["MISSING_OURS"]]["Gross Amount"].sum()
-    
+
     am_ours_sum = ours[ours["_rec_code"] == REC_CODES["AMOUNT_MISMATCH"]]["Gross Amount"].sum()
     am_theirs_sum = theirs[theirs["_rec_code"] == REC_CODES["AMOUNT_MISMATCH"]]["Gross Amount"].sum()
-    am_diff = am_ours_sum - am_theirs_sum
+    am_diff = am_ours_sum + am_theirs_sum
 
-    reconciling_item = missing_theirs_sum - missing_ours_sum + am_diff
+    reconciling_item = missing_theirs_sum + missing_ours_sum + am_diff
     residual = diff - reconciling_item
 
     # TDS column totals (used by the report Summary sheet + AI insights)
@@ -316,7 +337,10 @@ def reconcile(
             "Date_ours", "Invoice Ref_ours", "Gross Amount_ours", "Description_ours",
             "Date_theirs", "Invoice Ref_theirs", "Gross Amount_theirs", "Description_theirs"
         ]]
-        am_merged["Difference"] = am_merged["Gross Amount_ours"] - am_merged["Gross Amount_theirs"]
+        # Mirror-sign: a should-have-matched pair satisfies ours + theirs ~ 0,
+        # so the residual gap is the SUM (using "-" here would double-count
+        # the apparent gap, since theirs is roughly -ours for a near match).
+        am_merged["Difference"] = am_merged["Gross Amount_ours"] + am_merged["Gross Amount_theirs"]
 
     # Timing Differences (L2 Matches)
     l2_ours = ours[ours["_rec_code"] == REC_CODES["L2"]].copy()
