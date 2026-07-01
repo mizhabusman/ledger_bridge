@@ -254,6 +254,18 @@ def test_edge_cases():
     check("TDS: grossed-up invoice matches seller at L1", r.summary["matched_l1"] == 1,
           f"got {r.summary['matched_l1']}")
 
+    # ---- (D) Summary rows (TOTALS / sub total) must be dropped by standardize,
+    # while genuine transactions survive.
+    with_totals = pd.DataFrame([
+        ["2025-08-01", "Sales", "SV-1", "INV-D1", "Sales bill", "1000", "0", "0"],  # keep
+        ["",           "",      "",     "",       "TOTALS",     "9999", "0", "0"],  # drop
+        ["2025-08-02", "Sales", "SV-2", "INV-D2", "Sub Total",  "8888", "0", "0"],  # drop
+        ["2025-08-03", "Sales", "SV-3", "INV-D3", "Sales bill", "2000", "0", "0"],  # keep
+    ], columns=_EDGE_COLS)
+    std = standardize(with_totals, _EDGE_MAPPING_SELLER, role="seller")
+    check("Summary rows dropped, real rows kept", len(std) == 2,
+          f"got {len(std)} rows: {std['Description'].tolist()}")
+
     # ---- (C2) A payment row (debit only) must NOT be grossed up by its TDS.
     buyer_pay = pd.DataFrame([
         ["2025-06-01", "Payment", "BP-8", "INV-8", "pmt", "5000", "0", "500"],
@@ -300,6 +312,27 @@ def test_tds_reclassification():
     check("TDS: reclassified row has explanatory Notes",
           our_final.loc[our_final["Rec Code"] == tds_code, "Notes"].astype(str).str.len().gt(0).all()
           if n_reclassified else False)
+
+    # ---- journal-vs-journal overall status (both sides book TDS as journals).
+    # Seller: per-invoice TDS receivable journal (1000). Buyer: monthly challan
+    # journal (900). Neither has a TDS column → status must be PARTIAL, gap 100.
+    seller_jj = pd.DataFrame([
+        ["2025-07-05", "Journal", "JV-1", "TDSR1", "TDS receivable u/s 194Q",           "0", "1000", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_jj = pd.DataFrame([
+        ["2025-07-07", "Journal", "JV-2", "TDSC1", "TDS remitted to portal (challan)",  "900", "0", "0"],
+    ], columns=_EDGE_COLS)
+    o2 = standardize(seller_jj, _EDGE_MAPPING_SELLER, role="seller")
+    t2 = standardize(buyer_jj, _EDGE_MAPPING_BUYER, role="buyer")
+    r2 = reconcile(o2, t2)
+    tds2 = classify_tds_entries(
+        missing_in_theirs=r2.missing_in_theirs, missing_in_ours=r2.missing_in_ours,
+        our_full_ledger=r2.our_ledger, their_full_ledger=r2.their_ledger,
+    )
+    check("TDS journal-vs-journal both sides flagged",
+          len(tds2.flagged_entries) == 2, f"{len(tds2.flagged_entries)}")
+    check("TDS journal-vs-journal status == PARTIAL",
+          tds2.overall_status == "PARTIAL", f"{tds2.overall_status}: {tds2.status_message}")
 
 
 if __name__ == "__main__":

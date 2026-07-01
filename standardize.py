@@ -25,6 +25,7 @@ from config import CANONICAL_FIELDS
 _BALANCE_WORDS = [
     'opening balance', 'closing balance', 'grand total',
     'account closed', 'brought forward', 'carried forward',
+    'total', 'totals', 'sub total', 'subtotal',
 ]
 
 _ISO_DATE_RE = re.compile(r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}")

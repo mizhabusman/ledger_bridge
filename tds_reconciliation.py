@@ -291,6 +291,26 @@ def _overall_tds_status(
                 f"exceeds TDS counterparty withheld (₹{result.their_tds_column_total:,.2f}) "
                 f"by ₹{-diff:,.2f}. Needs investigation.")
 
+    # Both sides book TDS as journal entries (no dedicated column on either
+    # side) — common in Indian accounting where the seller posts per-invoice
+    # "TDS receivable" journals and the buyer posts monthly challan journals.
+    # Compare the two journal totals directly.
+    if result.our_tds_journal_total > 0 and result.their_tds_journal_total > 0:
+        diff = result.our_tds_journal_total - result.their_tds_journal_total
+        if abs(diff) <= tolerance:
+            return ("MATCHED",
+                    f"TDS journals agree: both sides have booked "
+                    f"~₹{result.our_tds_journal_total:,.2f}.")
+        if diff > 0:
+            return ("PARTIAL",
+                    f"Partial TDS posting: our journals total ₹{result.our_tds_journal_total:,.2f}, "
+                    f"counterparty's journals total ₹{result.their_tds_journal_total:,.2f}. "
+                    f"Gap: ₹{diff:,.2f} not yet booked by counterparty.")
+        return ("EXCESS",
+                f"Counterparty's TDS journals (₹{result.their_tds_journal_total:,.2f}) "
+                f"exceed ours (₹{result.our_tds_journal_total:,.2f}) by ₹{-diff:,.2f}. "
+                f"Needs investigation.")
+
     # Both sides have only column entries (no journals)
     if result.our_tds_column_total > 0 and result.their_tds_column_total > 0:
         diff = result.our_tds_column_total - result.their_tds_column_total
