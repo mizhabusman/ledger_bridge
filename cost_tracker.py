@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from config import PRICING, USD_TO_INR, CLAUDE_MODEL
+from config import PRICING, USD_TO_INR, CLAUDE_MODEL, PRICING_FALLBACK_MODEL
 
 
 @dataclass
@@ -99,7 +99,7 @@ def _calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     Falls back to Opus pricing if the model isn't in our table — we'd rather
     over-estimate than show the user a cost lower than reality.
     """
-    rates = PRICING.get(model, PRICING.get("claude-opus-4-5"))
+    rates = PRICING.get(model) or PRICING[PRICING_FALLBACK_MODEL]
     in_cost  = (input_tokens  / 1_000_000) * rates["input"]
     out_cost = (output_tokens / 1_000_000) * rates["output"]
     return in_cost + out_cost

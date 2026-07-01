@@ -17,6 +17,7 @@ class ReconciliationResult:
     our_ledger: pd.DataFrame
     their_ledger: pd.DataFrame
     summary: dict
+    matched: pd.DataFrame
     amount_mismatches: pd.DataFrame
     missing_in_theirs: pd.DataFrame
     missing_in_ours: pd.DataFrame
@@ -202,6 +203,10 @@ def reconcile(
     reconciling_item = missing_theirs_sum - missing_ours_sum + am_diff
     residual = diff - reconciling_item
 
+    # TDS column totals (used by the report Summary sheet + AI insights)
+    tds_ours = float(ours["TDS Amount"].sum()) if "TDS Amount" in ours.columns else 0.0
+    tds_theirs = float(theirs["TDS Amount"].sum()) if "TDS Amount" in theirs.columns else 0.0
+
     summary = {
         "total_our_records": len(ours),
         "total_their_records": len(theirs),
@@ -222,6 +227,10 @@ def reconcile(
         "reconciling_item": reconciling_item,
         "residual": residual,
         "reconciled": abs(residual) <= (amount_tolerance * 2), # Minor buffer for accum rounding
+        "amount_tolerance": amount_tolerance,
+        "tds_ours": tds_ours,
+        "tds_theirs": tds_theirs,
+        "tds_difference": tds_ours - tds_theirs,
     }
 
     # Extract clean dataframes for the UI/Excel report
@@ -254,6 +263,33 @@ def reconcile(
         ]]
         l2_merged["Days Difference"] = (l2_merged["Date_theirs"] - l2_merged["Date_ours"]).dt.days
 
+    # Combined Matched table (L1 + L2 + L3) — side-by-side pairs for the report/UI
+    matched_cols = [
+        "Match Level", "Invoice Ref", "Date (Ours)", "Date (Theirs)",
+        "Gross Amount (Ours)", "Gross Amount (Theirs)", "Description",
+    ]
+    matched_frames = []
+    for lvl in ("L1", "L2", "L3"):
+        o = ours[ours["_rec_code"] == REC_CODES[lvl]].copy()
+        if o.empty:
+            continue
+        m = o.merge(theirs, left_on="_match_idx", right_on="_internal_id", suffixes=("_ours", "_theirs"))
+        if m.empty:
+            continue
+        matched_frames.append(pd.DataFrame({
+            "Match Level":           lvl,
+            "Invoice Ref":           m["Invoice Ref_ours"],
+            "Date (Ours)":           m["Date_ours"],
+            "Date (Theirs)":         m["Date_theirs"],
+            "Gross Amount (Ours)":   m["Gross Amount_ours"],
+            "Gross Amount (Theirs)": m["Gross Amount_theirs"],
+            "Description":           m["Description_ours"],
+        }))
+    matched_df = (
+        pd.concat(matched_frames, ignore_index=True)
+        if matched_frames else pd.DataFrame(columns=matched_cols)
+    )
+
     # Missing
     missing_theirs_df = ours[ours["_rec_code"] == REC_CODES["MISSING_THEIRS"]][display_cols].copy()
     missing_ours_df = theirs[theirs["_rec_code"] == REC_CODES["MISSING_OURS"]][display_cols].copy()
@@ -271,6 +307,7 @@ def reconcile(
         our_ledger=ours,
         their_ledger=theirs,
         summary=summary,
+        matched=matched_df,
         amount_mismatches=am_merged,
         missing_in_theirs=missing_theirs_df,
         missing_in_ours=missing_ours_df,

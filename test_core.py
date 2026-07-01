@@ -1,163 +1,147 @@
 """
-End-to-end test of the deterministic core (no Claude).
+Self-contained end-to-end test of the deterministic core (no Claude, no sample files).
 
-Uses hardcoded mappings that simulate what Claude would return, then runs:
-ingest -> standardize -> reconcile
+Builds two synthetic raw ledgers in memory (a seller's book and the counterparty
+buyer's book), then runs the real pipeline:
 
-Verifies that the seeded mismatches are correctly identified.
+    standardize (with role) -> reconcile -> write_report
+
+and asserts the seeded matches / mismatches / missing rows are classified
+correctly. This locks the contract between reconcile.py and report.py so the
+kind of drift that broke the app (renamed summary keys, a dropped `matched`
+table) fails loudly here instead of at runtime.
+
+Run:  python test_core.py
 """
 
+import sys
+import tempfile
+from pathlib import Path
+
 import pandas as pd
-from ingest import load_ledger
+
 from standardize import standardize
 from reconcile import reconcile
+from report import write_report, write_standardized_ledger
 
 
-# Hardcoded mappings (simulating what Claude would return for these test files)
+# ── Synthetic raw ledgers ─────────────────────────────────────────────────────
+# Our books = SELLER view: invoices land in Debit (AR increases), receipts in Credit.
+OUR_RAW = pd.DataFrame([
+    # Date,        VchType,  VchNo,  Ref,        Narration,       Dr,      Cr,   TDS
+    ["2025-01-05", "Sales",  "SV-1", "INV-1001", "Sales bill",   "10000", "0",  "0"],  # L1 match
+    ["2025-01-10", "Sales",  "SV-2", "INV-1015", "Sales bill",   "5000",  "0",  "0"],  # L2 (timing)
+    ["2025-01-12", "Sales",  "SV-3", "INV-1012", "Sales bill",   "8000",  "0",  "0"],  # amount mismatch
+    ["2025-01-15", "Sales",  "SV-4", "INV-1010", "Sales bill",   "3000",  "0",  "0"],  # missing in theirs
+], columns=["Date", "Vch Type", "Vch No", "Ref No", "Narration", "Dr", "Cr", "TDS"])
+
+# Their books = BUYER view: invoices land in Credit (AP increases), payments in Debit.
+THEIR_RAW = pd.DataFrame([
+    # Date,        VchType,     VchNo,  Ref,        Narration,        Debit, Credit,  TDS
+    ["2025-01-05", "Purchase",  "BP-1", "INV-1001", "Purchase bill",  "0",   "10000", "0"],  # L1 match
+    ["2025-01-20", "Purchase",  "BP-2", "INV-1015", "Purchase bill",  "0",   "5000",  "0"],  # L2 (dates differ 10d)
+    ["2025-01-12", "Purchase",  "BP-3", "INV-1012", "Purchase bill",  "0",   "7000",  "0"],  # amount mismatch (7000 vs 8000)
+    ["2025-01-18", "Purchase",  "BP-4", "INV-1099", "Purchase bill",  "0",   "4000",  "0"],  # missing in ours
+], columns=["Date", "Vch Type", "Vch No", "Ref No", "Narration", "Debit", "Credit", "TDS"])
+
 OUR_MAPPING = {
-    "Date":         {"source": "Posting Date",    "confidence": "high"},
-    "Voucher Type": {"source": "Document Type",   "confidence": "high"},
-    "Voucher No":   {"source": "Document Number", "confidence": "high"},
-    "Invoice Ref":  {"source": "Reference",       "confidence": "high"},
-    "Description":  {"source": "Narration",       "confidence": "high"},
-    "Gross Amount": {"source": "Amount",          "confidence": "high"},
-    "TDS Amount":   {"source": "TDS",             "confidence": "high"},
+    "Date":         {"source": "Date"},
+    "Voucher Type": {"source": "Vch Type"},
+    "Voucher No":   {"source": "Vch No"},
+    "Invoice Ref":  {"source": "Ref No"},
+    "Description":  {"source": "Narration"},
+    "Debit":        {"source": "Dr"},
+    "Credit":       {"source": "Cr"},
+    "TDS Amount":   {"source": "TDS"},
 }
 
 THEIR_MAPPING = {
-    "Date":         {"source": "Date",         "confidence": "high"},
-    "Voucher Type": {"source": "Vch Type",     "confidence": "high"},
-    "Voucher No":   {"source": "Vch No.",      "confidence": "high"},
-    "Invoice Ref":  {"source": "Ref. No.",     "confidence": "high"},
-    "Description":  {"source": "Particulars",  "confidence": "high"},
-    # Their ledger has Debit/Credit split — special combined mapping
-    "Gross Amount": {"source": ["Debit", "Credit"], "combine": "debit_credit", "confidence": "high"},
-    "TDS Amount":   {"source": "TDS Amt",      "confidence": "high"},
+    "Date":         {"source": "Date"},
+    "Voucher Type": {"source": "Vch Type"},
+    "Voucher No":   {"source": "Vch No"},
+    "Invoice Ref":  {"source": "Ref No"},
+    "Description":  {"source": "Narration"},
+    "Debit":        {"source": "Debit"},
+    "Credit":       {"source": "Credit"},
+    "TDS Amount":   {"source": "TDS"},
 }
+
+
+# ── Tiny assertion harness ────────────────────────────────────────────────────
+_failures = []
+
+def check(name: str, ok: bool, detail: str = ""):
+    mark = "[PASS]" if ok else "[FAIL]"
+    print(f"  {mark}  {name}" + (f"  ({detail})" if detail and not ok else ""))
+    if not ok:
+        _failures.append(name)
 
 
 def main():
     print("=" * 70)
-    print("LedgerBridge AI — End-to-end Core Test")
+    print("LedgerBridge AI — Self-contained Core Test")
     print("=" * 70)
 
-    # 1) Ingest
-    print("\n[1/3] Ingesting files...")
-    ours_raw = load_ledger("samples/our_ledger_sap.xlsx", sheet_name="Vendor Ledger")
-    theirs_raw = load_ledger("samples/their_ledger_tally.xlsx", sheet_name="Ledger")
-    print(f"  Our raw:   {len(ours_raw)} rows, columns: {list(ours_raw.columns)}")
-    print(f"  Their raw: {len(theirs_raw)} rows, columns: {list(theirs_raw.columns)}")
+    # 1) Standardize with roles (Gross Amount is computed from Debit/Credit + role)
+    print("\n[1/3] Standardizing...")
+    ours = standardize(OUR_RAW, OUR_MAPPING, role="seller")
+    theirs = standardize(THEIR_RAW, THEIR_MAPPING, role="buyer")
+    print(f"  Our standardized:   {len(ours)} rows")
+    print(f"  Their standardized: {len(theirs)} rows")
+    check("both ledgers standardized to 4 rows", len(ours) == 4 and len(theirs) == 4,
+          f"got {len(ours)}, {len(theirs)}")
 
-    # 2) Standardize
-    print("\n[2/3] Standardizing to canonical schema...")
-    ours_std = standardize(ours_raw, OUR_MAPPING)
-    theirs_std = standardize(theirs_raw, THEIR_MAPPING)
-    print(f"  Our standardized:   {len(ours_std)} rows")
-    print(f"  Their standardized: {len(theirs_std)} rows")
-    print("\n  Sample of our standardized ledger:")
-    print(ours_std.head(3).to_string())
-
-    # Note: their ledger uses Debit/Credit semantics — Debit increases their AR (which is our AP).
-    # We need their amounts to have the same sign as ours for matching.
-    # In their book: Debit positive = invoice they raised (we owe them) -> we record this as positive too.
-    # In their book: Credit positive = receipt from us -> we record as negative (payment).
-    # So we need to FLIP the sign of their Gross Amount because (Debit - Credit) gives the wrong sign.
-    # Actually: Debit - Credit:
-    #   - Invoice row: Debit=15000, Credit=0 -> Gross = +15000  ✓ matches our +15000
-    #   - Receipt row: Debit=0, Credit=50000 -> Gross = -50000  ✓ matches our -50000
-    # So actually the signs already align! Good.
-
-    # 3) Reconcile
-    print("\n[3/3] Running reconciliation engine...")
-    result = reconcile(
-        ours_std,
-        theirs_std,
-        opening_balance_ours=0,
-        opening_balance_theirs=0,
-    )
-
+    # 2) Reconcile
+    print("\n[2/3] Reconciling...")
+    result = reconcile(ours, theirs, opening_balance_ours=0, opening_balance_theirs=0)
     s = result.summary
-    print(f"\n  --- Match Summary ---")
-    print(f"  L1 (Date+Ref+Amount):  {s['matched_l1']}")
-    print(f"  L2 (Ref+Amount):       {s['matched_l2']}  (timing differences)")
-    print(f"  L3 (Date+Amount):      {s['matched_l3']}  (review recommended)")
-    print(f"  Amount mismatches:     {s['amount_mismatches']}")
-    print(f"  Missing in theirs:     {s['missing_in_theirs']}  (in our books only)")
-    print(f"  Missing in ours:       {s['missing_in_ours']}    (in their books only)")
 
-    print(f"\n  --- Balance Walk ---")
-    print(f"  Sum of our transactions:    ₹{s['sum_our_transactions']:>15,.2f}")
-    print(f"  Sum of their transactions:  ₹{s['sum_their_transactions']:>15,.2f}")
-    print(f"  Difference:                 ₹{s['difference']:>15,.2f}")
-    print(f"  Reconciling items (sum of one-sided): ₹{s['reconciling_item']:>15,.2f}")
-    print(f"  Residual:                   ₹{s['residual']:>15,.2f}")
-    print(f"  Reconciled (within tolerance): {'✓ YES' if s['reconciled'] else '✗ NO'}")
+    check("L1 matches == 1 (INV-1001)", s["matched_l1"] == 1, f"got {s['matched_l1']}")
+    check("L2 matches == 1 (INV-1015 timing)", s["matched_l2"] == 1, f"got {s['matched_l2']}")
+    check("amount mismatches == 1 (INV-1012)", s["amount_mismatches"] == 1, f"got {s['amount_mismatches']}")
+    check("missing in theirs == 1 (INV-1010)", s["missing_in_theirs"] == 1, f"got {s['missing_in_theirs']}")
+    check("missing in ours == 1 (INV-1099)", s["missing_in_ours"] == 1, f"got {s['missing_in_ours']}")
 
-    print(f"\n  --- Validation against seeded mismatches ---")
-    # Verify INV-1010 is in missing_in_theirs
-    if "Invoice Ref" in result.missing_in_theirs.columns:
-        inv_1010 = result.missing_in_theirs[result.missing_in_theirs["Invoice Ref"] == "INV1010"]
-        print(f"  INV-1010 found in 'missing in theirs': {'✓' if len(inv_1010) == 1 else '✗ FAILED'}")
+    # summary contract keys that report.py / insights.py depend on
+    for key in ("amount_tolerance", "tds_ours", "tds_theirs", "tds_difference", "reconciled"):
+        check(f"summary has '{key}'", key in s)
 
-    # Verify INV-1099 is in missing_in_ours
-    if "Invoice Ref" in result.missing_in_ours.columns:
-        inv_1099 = result.missing_in_ours[result.missing_in_ours["Invoice Ref"] == "INV1099"]
-        print(f"  INV-1099 found in 'missing in ours':   {'✓' if len(inv_1099) == 1 else '✗ FAILED'}")
-
-    # Verify INV-1012 is in amount mismatches
-    if not result.amount_mismatches.empty and "Invoice Ref" in result.amount_mismatches.columns:
-        inv_1012 = result.amount_mismatches[result.amount_mismatches["Invoice Ref"] == "INV1012"]
-        print(f"  INV-1012 found in amount mismatches:   {'✓' if len(inv_1012) == 1 else '✗ FAILED'}")
-    else:
-        print(f"  INV-1012 found in amount mismatches:   ✗ FAILED (amount_mismatches table empty)")
-
-    # Verify INV-1015 is matched as L2 (timing)
-    if not result.matched.empty and "Invoice Ref" in result.matched.columns:
-        inv_1015 = result.matched[result.matched["Invoice Ref"] == "INV1015"]
-        is_l2 = len(inv_1015) == 1 and inv_1015.iloc[0]["Match Level"] == "L2"
-        print(f"  INV-1015 matched as L2 (timing):        {'✓' if is_l2 else '✗ FAILED'}")
-    else:
-        print(f"  INV-1015 matched as L2 (timing):        ✗ FAILED (matched table empty)")
-
-    # Verify both PAY-004 and PAY-005 matched (duplicate handling)
-    if not result.matched.empty and "Invoice Ref" in result.matched.columns:
-        pays = result.matched[result.matched["Invoice Ref"].isin(["PAY004", "PAY005"])]
-        print(f"  PAY-004 + PAY-005 both matched (dupes): {'✓' if len(pays) == 2 else '✗ FAILED (got ' + str(len(pays)) + ')'}")
-
-    # Print full matched table for inspection
-    print(f"\n  --- All Matched Records ---")
+    # matched table contract (report.py / this test read these columns)
+    check("result.matched exists with rows", not result.matched.empty, f"{len(result.matched)} rows")
     if not result.matched.empty:
-        print(result.matched.to_string())
+        for col in ("Match Level", "Invoice Ref"):
+            check(f"matched has '{col}' column", col in result.matched.columns)
+        inv1015 = result.matched[result.matched["Invoice Ref"] == "INV1015"]
+        check("INV-1015 present in matched as L2",
+              len(inv1015) == 1 and inv1015.iloc[0]["Match Level"] == "L2")
 
-    if not result.amount_mismatches.empty:
-        print(f"\n  --- Amount Mismatches ---")
-        print(result.amount_mismatches.to_string())
+    # exception tables carry the seeded refs (clean_voucher strips '-')
+    check("INV-1010 in missing_in_theirs",
+          "INV1010" in set(result.missing_in_theirs.get("Invoice Ref", pd.Series(dtype=str))))
+    check("INV-1099 in missing_in_ours",
+          "INV1099" in set(result.missing_in_ours.get("Invoice Ref", pd.Series(dtype=str))))
+    check("INV-1012 in amount_mismatches",
+          not result.amount_mismatches.empty
+          and "INV1012" in set(result.amount_mismatches.get("Invoice Ref_ours", pd.Series(dtype=str))))
 
-    if not result.missing_in_theirs.empty:
-        print(f"\n  --- Missing in Theirs (rows in our books only) ---")
-        print(result.missing_in_theirs[["Date", "Invoice Ref", "Description", "Gross Amount"]].to_string())
-
-    if not result.missing_in_ours.empty:
-        print(f"\n  --- Missing in Ours (rows in their books only) ---")
-        print(result.missing_in_ours[["Date", "Invoice Ref", "Description", "Gross Amount"]].to_string())
+    # 3) Report generation must not raise (this is where the app used to crash)
+    print("\n[3/3] Writing Excel report...")
+    out_dir = Path(tempfile.mkdtemp(prefix="lb_test_"))
+    try:
+        rec = write_report(result, out_dir / "reconciliation_report.xlsx")
+        write_standardized_ledger(result.our_ledger, out_dir / "our.xlsx", "Our Ledger")
+        write_standardized_ledger(result.their_ledger, out_dir / "their.xlsx", "Their Ledger")
+        check("write_report succeeded", Path(rec).exists())
+    except Exception as e:
+        check("write_report succeeded", False, repr(e))
 
     print("\n" + "=" * 70)
-    print("Test complete.")
+    if _failures:
+        print(f"RESULT: {len(_failures)} FAILED — {', '.join(_failures)}")
+        print("=" * 70)
+        sys.exit(1)
+    print("RESULT: ALL PASSED")
     print("=" * 70)
-
-    # ---------- Generate Excel reports ----------
-    print("\n[4/3] Generating Excel reports...")
-    from report import write_report, write_standardized_ledger
-
-    out_dir = "outputs"
-    rec_path = write_report(result, f"{out_dir}/reconciliation_report.xlsx",
-                            ai_insights="(AI insights would appear here in production — generated by Claude on the final reconciliation summary.)")
-    our_path = write_standardized_ledger(result.our_ledger, f"{out_dir}/standardized_our_books.xlsx", "Our Standardized Ledger")
-    their_path = write_standardized_ledger(result.their_ledger, f"{out_dir}/standardized_their_books.xlsx", "Their Standardized Ledger")
-
-    print(f"  ✓ {rec_path}")
-    print(f"  ✓ {our_path}")
-    print(f"  ✓ {their_path}")
 
 
 if __name__ == "__main__":

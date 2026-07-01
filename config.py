@@ -64,8 +64,11 @@ DEFAULT_AMOUNT_TOLERANCE = 1.00
 # Default date tolerance (days) for L2 timing-difference matching
 DEFAULT_DATE_TOLERANCE_DAYS = 45
 
-# Claude model
-CLAUDE_MODEL = "claude-3-5-sonnet-latest"
+# Claude model.
+# Mapping + role detection is a small structured task (8 sample rows in, a small
+# JSON out), so Haiku is the right cost/quality fit. Bump to claude-sonnet-4-6
+# if you want richer AI insights prose.
+CLAUDE_MODEL = "claude-haiku-4-5"
 
 # Sample rows sent to Claude during mapping
 MAPPING_SAMPLE_ROWS = 8
@@ -77,19 +80,23 @@ CACHE_DIR = "cache"
 # Claude API pricing (USD per 1 million tokens). Update if Anthropic changes rates.
 # Source: https://www.anthropic.com/pricing  (check periodically)
 PRICING = {
-    "claude-3-opus-20240229": {
-        "input":  15.00,   # $15 per 1M input tokens
-        "output": 75.00,   # $75 per 1M output tokens
+    "claude-opus-4-8": {
+        "input":   5.00,
+        "output": 25.00,
     },
-    "claude-3-5-sonnet-latest": {
+    "claude-sonnet-4-6": {
         "input":   3.00,
         "output":  15.00,
     },
-    "claude-3-5-haiku-latest": {
-        "input":   0.80,
-        "output":   4.00,
+    "claude-haiku-4-5": {
+        "input":   1.00,
+        "output":   5.00,
     },
 }
+
+# Model whose rates are used when a call reports a model that isn't in PRICING.
+# We fall back to the priciest known model so we never under-report cost.
+PRICING_FALLBACK_MODEL = "claude-opus-4-8"
 
 # USD → INR conversion rate (approximate; update periodically)
 # Used only for display in the UI; not for billing.

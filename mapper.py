@@ -165,5 +165,85 @@ def analyze_ledger(
 
     raw_text = response.content[0].text.strip()
 
-    # Robustly extract JSON block using regex (handles conversational preambles)
-    match = re.search(r'
+    result = _parse_analysis_json(raw_text)
+
+    # Normalize: ensure every mappable field exists in the mapping
+    mapping = result.get("mapping", {})
+    for field in MAPPABLE_FIELDS:
+        if field not in mapping or not isinstance(mapping[field], dict):
+            mapping[field] = {"source": None, "confidence": "n/a"}
+    result["mapping"] = mapping
+
+    # Ensure role is valid
+    if result.get("role") not in ("buyer", "seller"):
+        result["role"] = "buyer"
+        result["role_confidence"] = "low"
+        result["role_reasoning"] = "default (could not determine from data)"
+
+    # Cache the freshly computed analysis so identical formats skip the API
+    if use_cache:
+        _write_cache(fingerprint, result)
+
+    return result
+
+
+def _parse_analysis_json(raw_text: str) -> dict:
+    """
+    Extract the JSON object from Claude's reply.
+
+    Handles three cases robustly:
+      1. Clean JSON.
+      2. JSON wrapped in ```json ... ``` markdown fences.
+      3. JSON embedded in a conversational preamble/suffix.
+    """
+    text = raw_text.strip()
+
+    # Strip markdown fences if present
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 2:
+            text = parts[1]
+            if text.lstrip().lower().startswith("json"):
+                text = text.lstrip()[4:]
+            text = text.strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Fall back to grabbing the outermost {...} block
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Claude returned invalid JSON:\n{raw_text}\n\nError: {e}")
+
+    raise ValueError(f"Claude returned no JSON object:\n{raw_text}")
+
+
+def save_confirmed_analysis(df: pd.DataFrame, analysis: dict) -> None:
+    """Persist user-confirmed role + mapping so the same format skips the API next time."""
+    _write_cache(get_column_fingerprint(df), analysis)
+
+
+def _write_cache(fingerprint: str, analysis: dict) -> None:
+    cache_path = Path(CACHE_DIR) / f"{_safe_filename(fingerprint)}.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(analysis, indent=2))
+
+
+def _load_cached(fingerprint: str) -> dict | None:
+    cache_path = Path(CACHE_DIR) / f"{_safe_filename(fingerprint)}.json"
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
+
+
+def _safe_filename(s: str) -> str:
+    import hashlib
+    return hashlib.md5(s.encode()).hexdigest()[:16]

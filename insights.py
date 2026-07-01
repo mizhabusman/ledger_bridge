@@ -47,9 +47,8 @@ def generate_insights(
         cost_tracker: a CostTracker instance to record token usage.
                       If None, no cost tracking happens.
     """
-    summary = _build_summary_prompt(result)
-
     try:
+        summary = _build_summary_prompt(result)
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1500,
@@ -91,9 +90,9 @@ def _build_summary_prompt(result: ReconciliationResult) -> str:
         parts.append("AMOUNT MISMATCHES:")
         for _, r in result.amount_mismatches.head(20).iterrows():
             parts.append(
-                f"  - Invoice {r['Invoice Ref']} on {r['Date']}: "
-                f"ours=₹{r['Our Amount']:,.2f}, theirs=₹{r['Their Amount']:,.2f}, "
-                f"diff=₹{r['Difference']:,.2f}. Desc: {r['Description']}"
+                f"  - Invoice {r['Invoice Ref_ours']} on {r['Date_ours']}: "
+                f"ours=₹{r['Gross Amount_ours']:,.2f}, theirs=₹{r['Gross Amount_theirs']:,.2f}, "
+                f"diff=₹{r['Difference']:,.2f}. Desc: {r['Description_ours']}"
             )
         parts.append("")
 
@@ -117,8 +116,8 @@ def _build_summary_prompt(result: ReconciliationResult) -> str:
         parts.append("TIMING DIFFERENCES (matched on Ref+Amount but dates differ):")
         for _, r in result.timing_differences.head(20).iterrows():
             parts.append(
-                f"  - {r['Invoice Ref']}: ours={r['Our Date']}, theirs={r['Their Date']}, "
-                f"amount=₹{r['Our Amount']:,.2f}"
+                f"  - {r['Invoice Ref_ours']}: ours={r['Date_ours']}, theirs={r['Date_theirs']}, "
+                f"amount=₹{r['Gross Amount_ours']:,.2f}"
             )
         parts.append("")
 
