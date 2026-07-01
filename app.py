@@ -413,6 +413,12 @@ if st.session_state.step == 1:
         their_file = st.file_uploader("Drop your CSV / XLSX / XLS here", type=["csv", "xlsx", "xls"], key="their_upload", label_visibility="collapsed")
 
     if our_file and their_file:
+        # Prevent Out-Of-Memory (OOM) crashes by enforcing a 25MB limit
+        MAX_MB = 25
+        if (our_file.size > MAX_MB * 1024 * 1024) or (their_file.size > MAX_MB * 1024 * 1024):
+            banner("error", "File too large", f"One or both files exceed the {MAX_MB}MB limit. Please split them to prevent memory crashes.")
+            st.stop()
+
         st.markdown('<div class="lb-spacer-md"></div>', unsafe_allow_html=True)
         if st.button("Analyze →", type="primary", use_container_width=True):
             with st.spinner("Reading files and asking Claude to detect role + map columns..."):
