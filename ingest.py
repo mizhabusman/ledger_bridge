@@ -25,6 +25,10 @@ XLS_MAGIC  = b"\xD0\xCF\x11\xE0"
 # Extracts "Our Inv No : 25-26/GS-140" from Tally sub-row narration cells
 _INV_RE = re.compile(r'Our Inv No\s*:\s*([\w/\-]+)', re.IGNORECASE)
 
+# Detect leading ISO dates (YYYY-MM-DD / YYYY/MM/DD). Must match standardize.clean_date
+# so main-row detection here uses the SAME dayfirst convention as canonical parsing.
+_ISO_DATE_RE = re.compile(r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}")
+
 # Words that identify summary rows to skip entirely
 _SKIP_WORDS = ['Opening Balance', 'Grand Total', 'Closing Balance', 'Account Closed']
 
@@ -258,8 +262,11 @@ def _find_col_idx(headers: list[str], keywords: list[str]) -> int | None:
 def _is_valid_date(s: str) -> bool:
     if not s or s.lower() in ("nan", ""):
         return False
+    # ISO dates auto-detect; everything else is dayfirst (Indian DD-MM-YYYY),
+    # matching standardize.clean_date so both stages agree on ambiguous dates.
+    dayfirst = not bool(_ISO_DATE_RE.match(s))
     try:
-        pd.to_datetime(s, dayfirst=False)
+        pd.to_datetime(s, dayfirst=dayfirst)
         return True
     except Exception:
         return False

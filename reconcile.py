@@ -140,7 +140,10 @@ def reconcile(
             )
             matches = theirs[mask]
             if not matches.empty:
-                match_idx = matches.index[0]
+                # When a ref is duplicated on both sides, pair with the
+                # CLOSEST-amount candidate rather than the first by row order,
+                # so the reported per-invoice differences are the true minimums.
+                match_idx = (matches["Gross Amount"] - our_row["Gross Amount"]).abs().idxmin()
                 rec_id = f"AM-{i}"
                 ours.at[i, "_match_idx"] = match_idx
                 ours.at[i, "_rec_code"] = REC_CODES["AMOUNT_MISMATCH"]
@@ -153,33 +156,47 @@ def reconcile(
                 theirs.at[match_idx, "_match_level"] = "AM"
 
     # ---------------- LEVEL 3: Date + Amount (Missing/Mismatched Ref) ----------------
-    ours["_occ_l3"] = _add_occurrence_index(
-        ours.assign(_amt_key=ours["Gross Amount"].abs().round(2)), ["Date", "_amt_key"]
-    )
-    theirs["_occ_l3"] = _add_occurrence_index(
-        theirs.assign(_amt_key=theirs["Gross Amount"].abs().round(2)), ["Date", "_amt_key"]
-    )
-
+    # L3 is a fuzzy fallback: it matches on Date + Amount alone (no Invoice Ref),
+    # so any pairing risks joining two unrelated transactions that merely share a
+    # date and value. To keep that risk low we only accept an UNAMBIGUOUS match:
+    #   - exactly one unmatched candidate on their side within tolerance, AND
+    #   - this is the only unmatched row on our side that would claim it.
+    # Groups with several equally-plausible candidates are left as "missing" for
+    # human review rather than paired by arbitrary row order.
     for i, our_row in ours[ours["_match_idx"] == -1].iterrows():
-        mask = (
+        cand_mask = (
             (theirs["_match_idx"] == -1) &
             (theirs["Date"] == our_row["Date"]) &
-            (abs(theirs["Gross Amount"] - our_row["Gross Amount"]) <= amount_tolerance) &
-            (theirs["_occ_l3"] == our_row["_occ_l3"])
+            (abs(theirs["Gross Amount"] - our_row["Gross Amount"]) <= amount_tolerance)
         )
-        matches = theirs[mask]
-        if not matches.empty:
-            match_idx = matches.index[0]
-            rec_id = f"M3-{i}"
-            ours.at[i, "_match_idx"] = match_idx
-            ours.at[i, "_rec_code"] = REC_CODES["L3"]
-            ours.at[i, "_rec_id"] = rec_id
-            ours.at[i, "_match_level"] = "L3"
+        candidates = theirs[cand_mask]
+        if len(candidates) != 1:
+            continue  # 0 → no match; >1 → ambiguous, defer to review
 
-            theirs.at[match_idx, "_match_idx"] = i
-            theirs.at[match_idx, "_rec_code"] = REC_CODES["L3"]
-            theirs.at[match_idx, "_rec_id"] = rec_id
-            theirs.at[match_idx, "_match_level"] = "L3"
+        match_idx = candidates.index[0]
+        their_amt = theirs.at[match_idx, "Gross Amount"]
+        their_date = theirs.at[match_idx, "Date"]
+
+        # Reverse uniqueness: ensure no other unmatched row on our side is an
+        # equally-good claimant for this same counterparty row.
+        rev_mask = (
+            (ours["_match_idx"] == -1) &
+            (ours["Date"] == their_date) &
+            (abs(ours["Gross Amount"] - their_amt) <= amount_tolerance)
+        )
+        if int(rev_mask.sum()) != 1:
+            continue  # multiple ours rows compete → ambiguous, defer
+
+        rec_id = f"M3-{i}"
+        ours.at[i, "_match_idx"] = match_idx
+        ours.at[i, "_rec_code"] = REC_CODES["L3"]
+        ours.at[i, "_rec_id"] = rec_id
+        ours.at[i, "_match_level"] = "L3"
+
+        theirs.at[match_idx, "_match_idx"] = i
+        theirs.at[match_idx, "_rec_code"] = REC_CODES["L3"]
+        theirs.at[match_idx, "_rec_id"] = rec_id
+        theirs.at[match_idx, "_match_level"] = "L3"
 
     # ---------------- LEFTOVERS: MISSING ----------------
     ours.loc[ours["_match_idx"] == -1, "_rec_code"] = REC_CODES["MISSING_THEIRS"]

@@ -135,6 +135,9 @@ def main():
     except Exception as e:
         check("write_report succeeded", False, repr(e))
 
+    # 4) Correctness-tightening edge cases (item 2)
+    test_edge_cases()
+
     print("\n" + "=" * 70)
     if _failures:
         print(f"RESULT: {len(_failures)} FAILED — {', '.join(_failures)}")
@@ -142,6 +145,107 @@ def main():
         sys.exit(1)
     print("RESULT: ALL PASSED")
     print("=" * 70)
+
+
+# ── Edge cases for the item-2 correctness fixes ───────────────────────────────
+_EDGE_MAPPING_SELLER = {
+    "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
+    "Voucher No": {"source": "Vch No"}, "Invoice Ref": {"source": "Ref No"},
+    "Description": {"source": "Narration"}, "Debit": {"source": "Dr"},
+    "Credit": {"source": "Cr"}, "TDS Amount": {"source": "TDS"},
+}
+_EDGE_MAPPING_BUYER = {
+    "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
+    "Voucher No": {"source": "Vch No"}, "Invoice Ref": {"source": "Ref No"},
+    "Description": {"source": "Narration"}, "Debit": {"source": "Dr"},
+    "Credit": {"source": "Cr"}, "TDS Amount": {"source": "TDS"},
+}
+_EDGE_COLS = ["Date", "Vch Type", "Vch No", "Ref No", "Narration", "Dr", "Cr", "TDS"]
+
+
+def test_edge_cases():
+    print("\n[4/4] Edge cases (L3 uniqueness, AM closest-pair, TDS gross-up)...")
+
+    # ---- (A) Amount-mismatch pairing must join by CLOSEST amount, not row order.
+    # Duplicated ref INV-9 on both sides; naive first-row pairing would join
+    # 100<->205 and 200<->105 (huge diffs). Closest-pair joins 100<->105, 200<->205.
+    seller_am = pd.DataFrame([
+        ["2025-02-01", "Sales", "SV-9a", "INV-9", "bill", "100", "0", "0"],
+        ["2025-02-01", "Sales", "SV-9b", "INV-9", "bill", "200", "0", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_am = pd.DataFrame([
+        ["2025-02-01", "Purchase", "BP-9a", "INV-9", "bill", "0", "205", "0"],
+        ["2025-02-01", "Purchase", "BP-9b", "INV-9", "bill", "0", "105", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller_am, _EDGE_MAPPING_SELLER, role="seller")
+    t = standardize(buyer_am, _EDGE_MAPPING_BUYER, role="buyer")
+    r = reconcile(o, t)
+    am = r.amount_mismatches
+    check("AM: both duplicate-ref rows classified as mismatch", len(am) == 2, f"got {len(am)}")
+    if len(am) == 2:
+        pair = dict(zip(am["Gross Amount_ours"], am["Gross Amount_theirs"]))
+        check("AM: 100 paired with closest 105", pair.get(100.0) == 105.0, f"{pair}")
+        check("AM: 200 paired with closest 205", pair.get(200.0) == 205.0, f"{pair}")
+        check("AM: every pairing within 5 units",
+              am["Difference"].abs().max() <= 5.0, f"max diff {am['Difference'].abs().max()}")
+
+    # ---- (B) L3 must NOT pair ambiguous same-date/amount groups (no ref).
+    # 2 vs 2 identical, ref-less rows → ambiguous → left as missing, not matched.
+    seller_l3 = pd.DataFrame([
+        ["2025-03-01", "Journal", "JV-1", "", "adj", "500", "0", "0"],
+        ["2025-03-01", "Journal", "JV-2", "", "adj", "500", "0", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_l3 = pd.DataFrame([
+        ["2025-03-01", "Journal", "JV-3", "", "adj", "0", "500", "0"],
+        ["2025-03-01", "Journal", "JV-4", "", "adj", "0", "500", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller_l3, _EDGE_MAPPING_SELLER, role="seller")
+    t = standardize(buyer_l3, _EDGE_MAPPING_BUYER, role="buyer")
+    r = reconcile(o, t)
+    check("L3: ambiguous 2x2 group not matched (0 L3)", r.summary["matched_l3"] == 0,
+          f"got {r.summary['matched_l3']}")
+    check("L3: ambiguous rows fall through to missing",
+          r.summary["missing_in_theirs"] == 2 and r.summary["missing_in_ours"] == 2,
+          f"theirs={r.summary['missing_in_theirs']} ours={r.summary['missing_in_ours']}")
+
+    # ---- (B2) L3 SHOULD pair an unambiguous 1:1 ref-less row on date+amount.
+    seller_l3b = pd.DataFrame([
+        ["2025-04-01", "Journal", "JV-5", "", "adj", "750", "0", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_l3b = pd.DataFrame([
+        ["2025-04-01", "Journal", "JV-6", "", "adj", "0", "750", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller_l3b, _EDGE_MAPPING_SELLER, role="seller")
+    t = standardize(buyer_l3b, _EDGE_MAPPING_BUYER, role="buyer")
+    r = reconcile(o, t)
+    check("L3: unambiguous 1:1 ref-less row matched", r.summary["matched_l3"] == 1,
+          f"got {r.summary['matched_l3']}")
+
+    # ---- (C) Buyer TDS gross-up: net credit + withheld TDS must equal seller gross.
+    # Seller books gross 10000; buyer books net 9000 credit + 1000 TDS → gross-up 10000 → L1.
+    seller_tds = pd.DataFrame([
+        ["2025-05-01", "Sales", "SV-7", "INV-7", "bill", "10000", "0", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_tds = pd.DataFrame([
+        ["2025-05-01", "Purchase", "BP-7", "INV-7", "bill", "0", "9000", "1000"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller_tds, _EDGE_MAPPING_SELLER, role="seller")
+    t = standardize(buyer_tds, _EDGE_MAPPING_BUYER, role="buyer")
+    check("TDS: buyer invoice grossed up to 10000",
+          abs(float(t.iloc[0]["Gross Amount"]) - 10000.0) < 1e-6,
+          f"got {float(t.iloc[0]['Gross Amount'])}")
+    r = reconcile(o, t)
+    check("TDS: grossed-up invoice matches seller at L1", r.summary["matched_l1"] == 1,
+          f"got {r.summary['matched_l1']}")
+
+    # ---- (C2) A payment row (debit only) must NOT be grossed up by its TDS.
+    buyer_pay = pd.DataFrame([
+        ["2025-06-01", "Payment", "BP-8", "INV-8", "pmt", "5000", "0", "500"],
+    ], columns=_EDGE_COLS)
+    t = standardize(buyer_pay, _EDGE_MAPPING_BUYER, role="buyer")
+    check("TDS: payment row not grossed up (stays -5000)",
+          abs(float(t.iloc[0]["Gross Amount"]) - (-5000.0)) < 1e-6,
+          f"got {float(t.iloc[0]['Gross Amount'])}")
 
 
 if __name__ == "__main__":

@@ -250,8 +250,11 @@ def standardize(df: pd.DataFrame, mapping: dict, role: str = "buyer") -> pd.Data
         # the gross figure on the seller's side, which is the full amount billed.
         # Only add TDS on rows that look like invoice rows (Credit > 0).
         base = credit - debit
-        # Where this is an invoice row (credit-heavy), add TDS back to gross-up
-        invoice_mask = credit > 0
+        # Add TDS back only on PURE invoice rows — credit booked with no matching
+        # debit on the same line. A row carrying both debit and credit is an
+        # adjustment/net-off, not a fresh invoice, so grossing it up would inflate
+        # the balance and break the match against the seller's gross figure.
+        invoice_mask = (credit > 0) & (debit == 0)
         out["Gross Amount"] = base + (tds * invoice_mask.astype(float))
     else:
         # In a seller's customer ledger:
