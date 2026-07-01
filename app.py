@@ -22,7 +22,11 @@ import streamlit as st
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from config import MAPPABLE_FIELDS, DEFAULT_AMOUNT_TOLERANCE
+from config import (
+    MAPPABLE_FIELDS,
+    DEFAULT_ROUNDING_TOLERANCE,
+    DEFAULT_VARIANCE_BAND_PCT,
+)
 from ingest import load_ledger, list_sheets
 from mapper import analyze_ledger, save_confirmed_analysis
 from standardize import standardize
@@ -565,12 +569,24 @@ elif st.session_state.step == 3:
 
     st.markdown('<div class="lb-spacer-sm"></div>', unsafe_allow_html=True)
 
-    tolerance = st.number_input(
-        "Amount tolerance (₹)",
-        value=DEFAULT_AMOUNT_TOLERANCE,
-        step=0.5,
-        help="Amounts within this difference are treated as matched (handles rounding).",
-    )
+    ct1, ct2 = st.columns(2, gap="large")
+    with ct1:
+        rounding_tolerance = st.number_input(
+            "Rounding tolerance (₹)",
+            value=DEFAULT_ROUNDING_TOLERANCE,
+            step=0.5, min_value=0.0,
+            help="Amounts within this small difference are treated as a clean match "
+                 "(covers paise / GST rounding). Anything larger is surfaced, not hidden.",
+        )
+    with ct2:
+        variance_band_pct = st.number_input(
+            "Variance band (%)",
+            value=DEFAULT_VARIANCE_BAND_PCT * 100.0,
+            step=0.5, min_value=0.0,
+            help="A pair whose gap is beyond rounding but within this %% of the amount "
+                 "is flagged as 'Matched with variance' (e.g. a bank charge), not lost "
+                 "in Missing. Set 0 to disable.",
+        ) / 100.0
     enable_ai = st.checkbox(
         "Generate AI insights for the Summary sheet",
         value=True,
@@ -594,7 +610,8 @@ elif st.session_state.step == 3:
 
                 result = reconcile(
                     ours_std, theirs_std,
-                    amount_tolerance=tolerance,
+                    rounding_tolerance=rounding_tolerance,
+                    variance_band_pct=variance_band_pct,
                     opening_balance_ours=opening_ours,
                     opening_balance_theirs=opening_theirs,
                 )
@@ -604,7 +621,7 @@ elif st.session_state.step == 3:
                     missing_in_ours=result.missing_in_ours,
                     our_full_ledger=result.our_ledger,
                     their_full_ledger=result.their_ledger,
-                    tolerance=tolerance,
+                    tolerance=rounding_tolerance,
                 )
                 our_final, their_final = apply_tds_reclassification(
                     result.our_ledger, result.their_ledger, tds_result
@@ -663,19 +680,33 @@ elif st.session_state.step == 4:
     adj_missing_theirs = s["missing_in_theirs"] - tds_removed_theirs
     adj_missing_ours   = s["missing_in_ours"]   - tds_removed_ours
 
+    needs_review_total = (
+        s["amount_mismatches"] + s.get("variance", 0)
+        + s.get("sign_reversed", 0) + s.get("suspected_duplicates", 0)
+    )
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("L1 Matches", s["matched_l1"], help="Date + Ref + Amount all align")
     c2.metric("L2 Matches (Timing)", s["matched_l2"])
-    c3.metric("Amount Mismatches", s["amount_mismatches"])
-    c4.metric("Missing in Theirs", adj_missing_theirs,
-              help="In our books but not in theirs (TDS journal entries excluded — see TDS Reconciliation)")
+    c3.metric("L3 Matches (Review)", s["matched_l3"])
+    c4.metric("Needs Review", needs_review_total,
+              help="Probable pairs / anomalies to confirm — amount mismatches, variances, "
+                   "sign-reversed postings, suspected duplicates. See the Needs Review section below.")
 
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("L3 Matches (Review)", s["matched_l3"])
-    c6.metric("Missing in Ours", adj_missing_ours,
-              help="In their books but not in ours (TDS journal entries excluded — see TDS Reconciliation)")
-    c7.metric("Our Records", s["total_our_records"])
-    c8.metric("Their Records", s["total_their_records"])
+    c5.metric("Variance (e.g. bank charge)", s.get("variance", 0))
+    c6.metric("Sign-reversed", s.get("sign_reversed", 0),
+              help="Same amount & date but same sign — a likely posting error (wrong column).")
+    c7.metric("Suspected Duplicates", s.get("suspected_duplicates", 0))
+    c8.metric("Amount Mismatches", s["amount_mismatches"])
+
+    c9, c10, c11, c12 = st.columns(4)
+    c9.metric("Missing in Theirs", adj_missing_theirs,
+              help="In our books but not in theirs (TDS journal entries excluded — see TDS Reconciliation)")
+    c10.metric("Missing in Ours", adj_missing_ours,
+               help="In their books but not in ours (TDS journal entries excluded — see TDS Reconciliation)")
+    c11.metric("Our Records", s["total_our_records"])
+    c12.metric("Their Records", s["total_their_records"])
 
     st.markdown('<div class="lb-spacer-sm"></div>', unsafe_allow_html=True)
 
@@ -701,6 +732,20 @@ elif st.session_state.step == 4:
                    help="Should be ~0: the two ledgers are opposite-signed mirrors of the same transactions.")
         cb2.metric("Reconciling items", f"₹{s['reconciling_item']:,.2f}")
         cb3.metric("Residual", f"₹{s['residual']:,.2f}")
+
+    review = getattr(result, "needs_review", pd.DataFrame())
+    if review is not None and not review.empty:
+        with st.expander(f"🔎 Needs Review ({len(review)}) — probable pairs & anomalies", expanded=True):
+            st.markdown(
+                '<p style="color:#6B7280; margin-top:-6px; font-size:13px;">'
+                'These are not clean matches and not truly missing — a human should confirm each. '
+                '<strong>Gap</strong> is Ours + Theirs (≈0 would be a perfect mirror match).'
+                '</p>',
+                unsafe_allow_html=True,
+            )
+            fmt = {c: "{:,.2f}" for c in ("Gross (Ours)", "Gross (Theirs)", "Gap") if c in review.columns}
+            st.dataframe(review.style.format(fmt, na_rep="—"),
+                         use_container_width=True, hide_index=True)
 
     tds_result = st.session_state.get("tds_result")
     if tds_result is not None and tds_result.overall_status != "NO_TDS_ACTIVITY":

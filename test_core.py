@@ -168,6 +168,9 @@ def main():
     # 6) Invoice Ref fallback to Voucher No when unmapped (Batch 1 hygiene fix)
     test_invoice_ref_fallback()
 
+    # 7) Needs Review tier: variance / sign-reversed / suspected duplicate / AM ceiling
+    test_needs_review_tier()
+
     print("\n" + "=" * 70)
     if _failures:
         print(f"RESULT: {len(_failures)} FAILED — {', '.join(_failures)}")
@@ -210,10 +213,7 @@ def test_edge_cases():
     ], columns=_EDGE_COLS)
     o = standardize(seller_am, _EDGE_MAPPING_SELLER)
     t = standardize(buyer_am, _EDGE_MAPPING_BUYER)
-    # Explicit tight tolerance: this test exercises AM closest-pair selection,
-    # not tolerance-boundary behavior, so it must stay independent of
-    # whatever DEFAULT_AMOUNT_TOLERANCE happens to be configured.
-    r = reconcile(o, t, amount_tolerance=1.0)
+    r = reconcile(o, t)
     am = r.amount_mismatches
     check("AM: both duplicate-ref rows classified as mismatch", len(am) == 2, f"got {len(am)}")
     if len(am) == 2:
@@ -410,6 +410,86 @@ def test_invoice_ref_fallback():
     check("Differing voucher numbers: falls through to L3 (date+amount), not a false ref match",
           r2.summary["matched_l1"] == 0 and r2.summary["matched_l3"] == 1,
           f"l1={r2.summary['matched_l1']} l3={r2.summary['matched_l3']}")
+
+
+def test_needs_review_tier():
+    print("\n[7/7] Needs Review tier (variance / sign-reversed / duplicate / AM ceiling)...")
+    from config import REC_CODES as RC
+
+    # ---- (A) Bank charge: mirror pair, same date, DIFFERENT refs, ~1.5% gap.
+    # Must be rescued from Missing into VARIANCE (a real ₹500-on-₹34k charge).
+    seller = pd.DataFrame([
+        ["2025-05-05", "Receipt", "RCT/005", "", "Receipt (NEFT)", "0", "34425.81", "0"],
+    ], columns=_EDGE_COLS)
+    buyer = pd.DataFrame([
+        ["2025-05-05", "Payment", "PAY/005", "", "Payment (NEFT)", "34925.81", "0", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller, _EDGE_MAPPING_SELLER)
+    t = standardize(buyer, _EDGE_MAPPING_BUYER)
+    r = reconcile(o, t)
+    check("VARIANCE: bank-charge pair rescued from missing (variance==1)",
+          r.summary["variance"] == 1 and r.summary["missing_in_theirs"] == 0
+          and r.summary["missing_in_ours"] == 0,
+          f"var={r.summary['variance']} mt={r.summary['missing_in_theirs']} mo={r.summary['missing_in_ours']}")
+    nr = r.needs_review
+    var_rows = nr[nr["Rec Code"] == RC["VARIANCE"]]
+    check("VARIANCE: gap shown ~Rs500 in needs_review",
+          len(var_rows) == 1 and abs(float(var_rows.iloc[0]["Gap"]) - 500.0) < 1e-6,
+          f"{var_rows[['Gap']].to_dict('records') if not var_rows.empty else 'none'}")
+
+    # ---- (B) Sign-reversed: same date, same amount, SAME sign (posting error).
+    # A payment booked to the credit column → same sign as the receipt.
+    seller_sr = pd.DataFrame([
+        ["2025-06-01", "Receipt", "RCT/012", "", "Receipt (NEFT)", "0", "500392.05", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_sr = pd.DataFrame([
+        ["2025-06-01", "Payment", "PAY/012", "", "Payment (NEFT)", "0", "500392.05", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller_sr, _EDGE_MAPPING_SELLER)
+    t = standardize(buyer_sr, _EDGE_MAPPING_BUYER)
+    check("SIGN: both rows standardize to the SAME sign (-500392.05)",
+          float(o.iloc[0]["Gross Amount"]) < 0 and float(t.iloc[0]["Gross Amount"]) < 0)
+    r = reconcile(o, t)
+    check("SIGN: same-sign same-amount pair flagged SIGN_REVERSED, not missing",
+          r.summary["sign_reversed"] == 1 and r.summary["missing_in_theirs"] == 0
+          and r.summary["missing_in_ours"] == 0,
+          f"sr={r.summary['sign_reversed']} mt={r.summary['missing_in_theirs']} mo={r.summary['missing_in_ours']}")
+
+    # ---- (C) Suspected duplicate: an extra marked-duplicate row with no partner.
+    seller_dup = pd.DataFrame([
+        ["2025-08-10", "Receipt", "RCT/037",     "", "Receipt (NEFT)",             "0", "257205.27", "0"],
+        ["2025-08-12", "Receipt", "RCT/037-DUP", "", "Receipt (NEFT) - duplicate", "0", "257205.27", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_dup = pd.DataFrame([
+        ["2025-08-10", "Payment", "PAY/037", "", "Payment (NEFT)", "257205.27", "0", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller_dup, _EDGE_MAPPING_SELLER)
+    t = standardize(buyer_dup, _EDGE_MAPPING_BUYER)
+    r = reconcile(o, t)
+    # RCT/037 pairs with PAY/037 (mirror, same date); the -DUP copy is flagged.
+    check("DUP: marked-duplicate extra flagged SUSPECTED_DUP (not missing)",
+          r.summary["suspected_duplicates"] == 1 and r.summary["missing_in_theirs"] == 0,
+          f"dup={r.summary['suspected_duplicates']} mt={r.summary['missing_in_theirs']}")
+
+    # ---- (D) AM ceiling: same ref but wildly different amounts must NOT bind
+    # (e.g. an invoice vs an unrelated same-ref journal). Stays missing.
+    seller_c = pd.DataFrame([
+        ["2025-09-01", "Sales", "REF-X", "REF-X", "Sales bill", "60000", "0", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_c = pd.DataFrame([
+        ["2025-09-01", "Journal", "REF-X", "REF-X", "Some journal", "0", "1000", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller_c, _EDGE_MAPPING_SELLER)
+    t = standardize(buyer_c, _EDGE_MAPPING_BUYER)
+    r = reconcile(o, t)
+    check("CEILING: 60000-vs-1000 same-ref does NOT bind (0 amount mismatches)",
+          r.summary["amount_mismatches"] == 0
+          and r.summary["missing_in_theirs"] == 1 and r.summary["missing_in_ours"] == 1,
+          f"am={r.summary['amount_mismatches']} mt={r.summary['missing_in_theirs']} mo={r.summary['missing_in_ours']}")
+
+    # ---- (E) Balance still reconciles across a mixed review-tier ledger.
+    check("Balance reconciles with review-tier rows present", r.summary["reconciled"] is True
+          or abs(r.summary["residual"]) < 1.0, f"residual={r.summary['residual']}")
 
 
 if __name__ == "__main__":

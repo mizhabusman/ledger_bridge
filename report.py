@@ -70,6 +70,7 @@ def write_report(
     if tds_result is not None:
         _write_tds_reconciliation(wb, tds_result)
     _write_matched(wb, result)
+    _write_needs_review(wb, result)
     _write_amount_mismatches(wb, result)
     _write_missing_theirs(wb, result, tds_result=tds_result)
     _write_missing_ours(wb, result, tds_result=tds_result)
@@ -129,6 +130,9 @@ def _write_summary(wb: Workbook, result: ReconciliationResult, ai_insights: str,
         ("L2 matches (Ref + Amount, dates differ)", s["matched_l2"]),
         ("L3 matches (Date + Amount, weak)", s["matched_l3"]),
         ("Amount mismatches", s["amount_mismatches"]),
+        ("Variance (e.g. bank charge / short payment)", s.get("variance", 0)),
+        ("Sign-reversed (possible posting error)", s.get("sign_reversed", 0)),
+        ("Suspected duplicates", s.get("suspected_duplicates", 0)),
         ("Missing in their books", adj_missing_theirs),
         ("Missing in our books", adj_missing_ours),
     ]
@@ -419,6 +423,19 @@ def _write_matched(wb: Workbook, result: ReconciliationResult) -> None:
         ws["A1"] = "(No matched records)"
         return
     _write_df_to_sheet(ws, df, start_row=1)
+    _auto_column_widths(ws, df, start_row=1)
+    _highlight_amount_cols(ws, df, start_row=1)
+
+
+def _write_needs_review(wb: Workbook, result: ReconciliationResult) -> None:
+    ws = wb.create_sheet("Needs Review")
+    df = getattr(result, "needs_review", None)
+    if df is None or df.empty:
+        ws["A1"] = "(Nothing needs review — every row is a clean match or genuinely missing)"
+        return
+    # Reason-first table so the accountant can act row-by-row. "Gap" is
+    # Ours + Theirs (mirror-sign); ≈0 would be a perfect match.
+    _write_df_to_sheet(ws, df, start_row=1, header_fill=WARN_FILL)
     _auto_column_widths(ws, df, start_row=1)
     _highlight_amount_cols(ws, df, start_row=1)
 

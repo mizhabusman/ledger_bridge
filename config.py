@@ -49,16 +49,55 @@ REC_CODES = {
     "L2": "MATCHED_L2_TIMING",
     "L3": "MATCHED_L3_REVIEW",
     "AMOUNT_MISMATCH": "AMOUNT_MISMATCH",
+    "VARIANCE": "MATCH_VARIANCE",             # paired, small variance (e.g. bank charge)
+    "SIGN_REVERSED": "SIGN_REVERSED_REVIEW",  # same amount+date, same sign (posting error)
+    "SUSPECTED_DUP": "SUSPECTED_DUPLICATE",   # duplicate of another same-side row
     "MISSING_OURS": "MISSING_IN_OURS",
     "MISSING_THEIRS": "MISSING_IN_THEIRS",
     "TDS_DIFF": "TDS_DIFFERENCE",
     "TDS_ENTRY": "TDS_ENTRY_OTHER_SIDE",   # journal entry reconciled via TDS sheet
 }
 
-# Default amount tolerance (currency units). ₹1 was unrealistically tight —
-# real bank charges / rounding differences commonly run into the hundreds.
-# Still user-adjustable per run via the UI's "Amount tolerance" input.
-DEFAULT_AMOUNT_TOLERANCE = 50.00
+# Human-readable reasons for the "Needs Review" report section, keyed by rec code.
+REC_REASONS = {
+    "AMOUNT_MISMATCH":       "Amount mismatch (same invoice ref, amounts differ)",
+    "MATCH_VARIANCE":        "Matched with variance (e.g. bank charge / short payment)",
+    "SIGN_REVERSED_REVIEW":  "Possible posting error (same amount & date, same sign)",
+    "SUSPECTED_DUPLICATE":   "Suspected duplicate (identical entry on the same side)",
+}
+
+# The set of rec codes that make up the "Needs Review" tier (between a clean
+# match and a genuine "missing"). Order controls display order.
+NEEDS_REVIEW_CODES = [
+    "AMOUNT_MISMATCH", "MATCH_VARIANCE", "SIGN_REVERSED_REVIEW", "SUSPECTED_DUPLICATE",
+]
+
+# ─────────────────────────── matching tolerances ────────────────────────────
+# Two-band amount model (all comparisons are mirror-sign: a true pair satisfies
+# ours + theirs ≈ 0, so the "gap" is abs(ours + theirs)):
+#   - gap <= rounding_tolerance                → CLEAN match (L1/L2/L3)
+#   - rounding < gap <= variance_band          → paired but flagged MATCH_VARIANCE
+#   - variance_band < gap <= am_ceiling        → AMOUNT_MISMATCH (ref-matched only)
+#   - gap > am_ceiling                          → not paired (left for review/missing)
+# variance_band and am_ceiling are PERCENTAGES of the row magnitude, so a ₹500
+# charge on a ₹34k receipt (1.5%) is caught while a ₹500 gap on a ₹600 row is not.
+
+# Absolute rounding tolerance (currency units) for a clean match. Covers paise /
+# GST rounding; anything larger is surfaced rather than silently absorbed.
+DEFAULT_ROUNDING_TOLERANCE = 1.00
+
+# Variance band as a fraction of the row magnitude (2%). Beyond rounding but
+# within this → MATCH_VARIANCE. User-adjustable via the UI.
+DEFAULT_VARIANCE_BAND_PCT = 0.02
+
+# Amount-mismatch ceiling as a fraction of the row magnitude (15%). A ref-matched
+# pair whose gap exceeds this is NOT paired (prevents an invoice binding to an
+# unrelated same-ref journal of wildly different value).
+DEFAULT_AM_CEILING_PCT = 0.15
+
+# Back-compat alias: the old single "amount tolerance" now maps to the variance
+# band's absolute floor (used where a percentage of a tiny amount would be < this).
+DEFAULT_AMOUNT_TOLERANCE = 1.00
 
 # Default date tolerance (days) for L2 timing-difference matching
 DEFAULT_DATE_TOLERANCE_DAYS = 45
