@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 
 import pandas as pd
 from anthropic import Anthropic
@@ -164,61 +165,5 @@ def analyze_ledger(
 
     raw_text = response.content[0].text.strip()
 
-    # Strip markdown fences if Claude wrapped the JSON
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("```")[1]
-        if raw_text.startswith("json"):
-            raw_text = raw_text[4:]
-        raw_text = raw_text.strip()
-
-    try:
-        result = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Claude returned invalid JSON:\n{raw_text}\n\nError: {e}")
-
-    # Backward-compat normalization: ensure every mappable field exists
-    mapping = result.get("mapping", {})
-    for field in MAPPABLE_FIELDS:
-        if field not in mapping:
-            mapping[field] = {"source": None, "confidence": "n/a"}
-    result["mapping"] = mapping
-
-    # Ensure role exists
-    if result.get("role") not in ("buyer", "seller"):
-        result["role"] = "buyer"
-        result["role_confidence"] = "low"
-        result["role_reasoning"] = "default (could not determine from data)"
-
-    return result
-
-
-def save_confirmed_analysis(df: pd.DataFrame, analysis: dict) -> None:
-    """Persist user-confirmed role + mapping so the same format skips the API next time."""
-    fingerprint = get_column_fingerprint(df)
-    cache_path = Path(CACHE_DIR) / f"{_safe_filename(fingerprint)}.json"
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(analysis, indent=2))
-
-
-def _load_cached(fingerprint: str) -> dict | None:
-    cache_path = Path(CACHE_DIR) / f"{_safe_filename(fingerprint)}.json"
-    if cache_path.exists():
-        return json.loads(cache_path.read_text())
-    return None
-
-
-def _safe_filename(s: str) -> str:
-    import hashlib
-    return hashlib.md5(s.encode()).hexdigest()[:16]
-
-
-# Backward-compat aliases — old code that imports map_columns / save_confirmed_mapping
-# still works but operates on the new analysis shape.
-def map_columns(df, client, use_cache=True):
-    """Deprecated: use analyze_ledger. Returns just the mapping dict."""
-    return analyze_ledger(df, client, use_cache).get("mapping", {})
-
-
-def save_confirmed_mapping(df, mapping):
-    """Deprecated: use save_confirmed_analysis."""
-    save_confirmed_analysis(df, {"role": "buyer", "mapping": mapping})
+    # Robustly extract JSON block using regex (handles conversational preambles)
+    match = re.search(r'
