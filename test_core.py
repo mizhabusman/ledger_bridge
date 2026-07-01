@@ -154,6 +154,9 @@ def main():
     # 5) Rec Code sync + TDS reclassification wiring (bugs A & B)
     test_tds_reclassification()
 
+    # 6) Invoice Ref fallback to Voucher No when unmapped (Batch 1 hygiene fix)
+    test_invoice_ref_fallback()
+
     print("\n" + "=" * 70)
     if _failures:
         print(f"RESULT: {len(_failures)} FAILED — {', '.join(_failures)}")
@@ -333,6 +336,54 @@ def test_tds_reclassification():
           len(tds2.flagged_entries) == 2, f"{len(tds2.flagged_entries)}")
     check("TDS journal-vs-journal status == PARTIAL",
           tds2.overall_status == "PARTIAL", f"{tds2.overall_status}: {tds2.status_message}")
+
+
+def test_invoice_ref_fallback():
+    print("\n[6/6] Invoice Ref fallback to Voucher No when unmapped...")
+
+    # No "Invoice Ref" source at all — only Voucher No, matching ledgers that
+    # use the same voucher/document number as their shared cross-party ref.
+    mapping_no_ref = {
+        "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
+        "Voucher No": {"source": "Vch No"}, "Description": {"source": "Narration"},
+        "Debit": {"source": "Dr"}, "Credit": {"source": "Cr"}, "TDS Amount": {"source": "TDS"},
+    }
+    raw = pd.DataFrame([
+        ["2025-09-01", "Sales", "ALP/25-26/001", "", "Sales bill", "5000", "0", "0"],
+    ], columns=_EDGE_COLS)
+    std = standardize(raw, mapping_no_ref, role="seller")
+    check("Invoice Ref falls back to Voucher No value",
+          std.iloc[0]["Invoice Ref"] == std.iloc[0]["Voucher No"] == "ALP2526001",
+          f"Invoice Ref={std.iloc[0]['Invoice Ref']!r} Voucher No={std.iloc[0]['Voucher No']!r}")
+
+    # End-to-end: two ledgers sharing a voucher number as their only common
+    # identifier, neither mapping Invoice Ref explicitly, must still L1-match.
+    seller_raw = pd.DataFrame([
+        ["2025-09-05", "Sales", "ALP/25-26/010", "", "Sales bill", "12000", "0", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_raw = pd.DataFrame([
+        ["2025-09-05", "Purchase", "ALP/25-26/010", "", "Purchase bill", "0", "12000", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller_raw, mapping_no_ref, role="seller")
+    t = standardize(buyer_raw, mapping_no_ref, role="buyer")
+    r = reconcile(o, t)
+    check("Shared voucher no (no explicit Invoice Ref) still L1-matches",
+          r.summary["matched_l1"] == 1, f"{r.summary['matched_l1']}")
+
+    # When Voucher No genuinely differs between ledgers too, fallback must not
+    # cause a false match — behavior stays identical to leaving Invoice Ref blank.
+    seller_raw2 = pd.DataFrame([
+        ["2025-09-06", "Sales", "SV-999", "", "Sales bill", "12000", "0", "0"],
+    ], columns=_EDGE_COLS)
+    buyer_raw2 = pd.DataFrame([
+        ["2025-09-06", "Purchase", "BP-888", "", "Purchase bill", "0", "12000", "0"],
+    ], columns=_EDGE_COLS)
+    o2 = standardize(seller_raw2, mapping_no_ref, role="seller")
+    t2 = standardize(buyer_raw2, mapping_no_ref, role="buyer")
+    r2 = reconcile(o2, t2)
+    check("Differing voucher numbers: falls through to L3 (date+amount), not a false ref match",
+          r2.summary["matched_l1"] == 0 and r2.summary["matched_l3"] == 1,
+          f"l1={r2.summary['matched_l1']} l3={r2.summary['matched_l3']}")
 
 
 if __name__ == "__main__":

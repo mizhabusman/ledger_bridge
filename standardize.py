@@ -223,9 +223,17 @@ def standardize(df: pd.DataFrame, mapping: dict, role: str = "buyer") -> pd.Data
     src = get_src("Voucher No")
     out["Voucher No"] = df[src].apply(clean_voucher) if (src and src in df.columns) else ""
 
-    # Invoice Ref (primary match key)
+    # Invoice Ref (primary match key). Falls back to the already-computed
+    # Voucher No when no separate external reference column was mapped — many
+    # ledger pairs use the same voucher/document number as the shared
+    # cross-party identifier, with no distinct "invoice number" column at all.
+    # Safe when the fallback doesn't apply: if Voucher No differs between the
+    # two ledgers too, ref-based matching finds nothing either way, same as
+    # leaving this blank — it can only help, never hurt.
     src = get_src("Invoice Ref")
-    out["Invoice Ref"] = df[src].apply(clean_voucher) if (src and src in df.columns) else ""
+    out["Invoice Ref"] = (
+        df[src].apply(clean_voucher) if (src and src in df.columns) else out["Voucher No"]
+    )
 
     # Description
     src = get_src("Description")

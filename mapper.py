@@ -38,10 +38,10 @@ PART 1: COLUMN MAPPING
 
 Map source columns to these canonical fields:
 
-- Date: Transaction or posting date.
+- Date: The INVOICE date — the date printed on the actual invoice/bill, not when it was posted/entered into the books. If a ledger has both an explicit "Invoice Date" column AND a separate "Posting Date"/"Entry Date"/"Value Date" column, ALWAYS prefer the invoice date column. Only fall back to a generic posting/entry date if no distinct invoice date column exists.
 - Voucher Type: Classification (Sales, Purchase, Payment, Receipt, Journal, Bank Receipt, Bank Payment, Credit Note, etc.)
 - Voucher No: INTERNAL voucher/document number assigned by the source system (e.g. 1000/25/BP-712, 2025-26/SV-140).
-- Invoice Ref: EXTERNAL invoice reference shared between both parties (e.g. 25-26/GS-140, INV-1023). This is the KEY match field. Common headers: Invoice-No, Invoice No, Inv No, Our Inv No, Bill No, Ref No, Reference.
+- Invoice Ref: EXTERNAL invoice reference shared between both parties (e.g. 25-26/GS-140, INV-1023). This is the KEY match field. Common headers: Invoice-No, Invoice No, Inv No, Our Inv No, Bill No, Ref No, Reference. If there is NO separate external-reference column and the Voucher No is the identifier both parties would plausibly share (e.g. both books cite the same document number when recording the transaction), map that SAME source column to both Voucher No and Invoice Ref rather than leaving Invoice Ref null.
 - Description: Free-text narration. Common headers: Narration, Particulars, Description, Remarks.
 - Debit: The Debit column. Common headers: Debit, Dr, Dr Amount, Debit Amount.
 - Credit: The Credit column. Common headers: Credit, Cr, Cr Amount, Credit Amount.

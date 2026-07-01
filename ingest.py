@@ -146,8 +146,12 @@ def _parse_tally_multirow(raw: pd.DataFrame) -> pd.DataFrame:
     # Read actual header labels
     headers = [str(raw.iloc[header_idx, c]).strip() for c in range(raw.shape[1])]
 
-    # Identify key column positions by header label
-    col_date   = _find_col_idx(headers, ["date"])
+    # Identify key column positions by header label. Prefer an explicit
+    # "invoice date" column over a generic posting/entry/value date column
+    # when both are present, since matching should key off the invoice date.
+    col_date = _find_col_idx(headers, ["invoice date"])
+    if col_date is None:
+        col_date = _find_col_idx(headers, ["date"])
     col_vch    = _find_col_idx(headers, ["vch", "voucher no"])
     col_partic = _find_col_idx(headers, ["particular", "narration", "description"])
     col_debit  = _find_col_idx(headers, ["debit"])
