@@ -194,12 +194,12 @@ def _parse_tally_multirow(raw: pd.DataFrame) -> pd.DataFrame:
             if current:
                 records.append(current)
 
-            # Determine amount and sign:
-            # Debit = they recorded money coming IN (invoice raised on buyer)
-            # Credit = they recorded money going OUT (payment received, CN issued)
-            # From reconciliation perspective we want a SIGNED gross:
-            #   Invoice (SV) = positive (buyer owes them)
-            #   Credit Note (CN) = negative (reduces what buyer owes)
+            # Determine amount and sign. These are raw, per-voucher-type
+            # illustrations of typical Tally bookkeeping (the actual signed
+            # Gross Amount used for matching is computed uniformly downstream
+            # in standardize.py as Debit - Credit, with no per-role branching):
+            #   Invoice (SV) = positive (counterparty owes more)
+            #   Credit Note (CN) = negative (reduces what's owed)
             #   Bank Receipt (BR) = negative (money received, reduces balance)
             #   Journal (JV) = depends on which column has value
             gross_raw = debit if debit else credit

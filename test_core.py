@@ -210,7 +210,10 @@ def test_edge_cases():
     ], columns=_EDGE_COLS)
     o = standardize(seller_am, _EDGE_MAPPING_SELLER)
     t = standardize(buyer_am, _EDGE_MAPPING_BUYER)
-    r = reconcile(o, t)
+    # Explicit tight tolerance: this test exercises AM closest-pair selection,
+    # not tolerance-boundary behavior, so it must stay independent of
+    # whatever DEFAULT_AMOUNT_TOLERANCE happens to be configured.
+    r = reconcile(o, t, amount_tolerance=1.0)
     am = r.amount_mismatches
     check("AM: both duplicate-ref rows classified as mismatch", len(am) == 2, f"got {len(am)}")
     if len(am) == 2:

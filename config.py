@@ -55,8 +55,10 @@ REC_CODES = {
     "TDS_ENTRY": "TDS_ENTRY_OTHER_SIDE",   # journal entry reconciled via TDS sheet
 }
 
-# Default amount tolerance (currency units)
-DEFAULT_AMOUNT_TOLERANCE = 1.00
+# Default amount tolerance (currency units). ₹1 was unrealistically tight —
+# real bank charges / rounding differences commonly run into the hundreds.
+# Still user-adjustable per run via the UI's "Amount tolerance" input.
+DEFAULT_AMOUNT_TOLERANCE = 50.00
 
 # Default date tolerance (days) for L2 timing-difference matching
 DEFAULT_DATE_TOLERANCE_DAYS = 45
