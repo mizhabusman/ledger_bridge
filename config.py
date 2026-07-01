@@ -62,10 +62,10 @@ REC_CODES = {
 DEFAULT_AMOUNT_TOLERANCE = 1.00
 
 # Default date tolerance (days) for L2 timing-difference matching
-DEFAULT_DATE_TOLERANCE_DAYS = 180
+DEFAULT_DATE_TOLERANCE_DAYS = 45
 
 # Claude model
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL = "claude-3-5-sonnet-latest"
 
 # Sample rows sent to Claude during mapping
 MAPPING_SAMPLE_ROWS = 8
@@ -77,15 +77,15 @@ CACHE_DIR = "cache"
 # Claude API pricing (USD per 1 million tokens). Update if Anthropic changes rates.
 # Source: https://www.anthropic.com/pricing  (check periodically)
 PRICING = {
-    "claude-opus-4-5": {
+    "claude-3-opus-20240229": {
         "input":  15.00,   # $15 per 1M input tokens
         "output": 75.00,   # $75 per 1M output tokens
     },
-    "claude-sonnet-4-6": {
+    "claude-3-5-sonnet-latest": {
         "input":   3.00,
         "output":  15.00,
     },
-    "claude-haiku-4-5": {
+    "claude-3-5-haiku-latest": {
         "input":   0.80,
         "output":   4.00,
     },
