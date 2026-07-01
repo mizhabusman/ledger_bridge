@@ -23,6 +23,8 @@ import pandas as pd
 from standardize import standardize
 from reconcile import reconcile
 from report import write_report, write_standardized_ledger
+from tds_reconciliation import classify_tds_entries, apply_tds_reclassification
+from config import CANONICAL_FIELDS, REC_CODES
 
 
 # ── Synthetic raw ledgers ─────────────────────────────────────────────────────
@@ -135,8 +137,22 @@ def main():
     except Exception as e:
         check("write_report succeeded", False, repr(e))
 
+    # exported ledger must publish the canonical Rec Code + drop internal cols
+    check("our_ledger 'Rec Code' populated (not blank)",
+          (result.our_ledger["Rec Code"].astype(str) != "").all(),
+          f"blank rows: {(result.our_ledger['Rec Code'].astype(str) == '').sum()}")
+    check("our_ledger has no internal _ columns",
+          not any(c.startswith("_") for c in result.our_ledger.columns),
+          f"cols: {list(result.our_ledger.columns)}")
+    check("our_ledger columns == canonical schema",
+          list(result.our_ledger.columns) == CANONICAL_FIELDS,
+          f"cols: {list(result.our_ledger.columns)}")
+
     # 4) Correctness-tightening edge cases (item 2)
     test_edge_cases()
+
+    # 5) Rec Code sync + TDS reclassification wiring (bugs A & B)
+    test_tds_reclassification()
 
     print("\n" + "=" * 70)
     if _failures:
@@ -246,6 +262,44 @@ def test_edge_cases():
     check("TDS: payment row not grossed up (stays -5000)",
           abs(float(t.iloc[0]["Gross Amount"]) - (-5000.0)) < 1e-6,
           f"got {float(t.iloc[0]['Gross Amount'])}")
+
+
+def test_tds_reclassification():
+    print("\n[5/5] Rec Code sync + TDS reclassification (bugs A & B)...")
+    # Seller books a sale (matched) plus a separate TDS-receivable journal row
+    # that has no counterpart on the buyer side (structurally different booking).
+    seller = pd.DataFrame([
+        ["2025-07-01", "Sales",   "SV-100", "INV-100", "Sales bill",              "10000", "0", "0"],
+        ["2025-07-01", "Journal", "JV-100", "TDSJV1",  "TDS receivable u/s 194Q", "0", "1000", "0"],
+    ], columns=_EDGE_COLS)
+    buyer = pd.DataFrame([
+        ["2025-07-01", "Purchase", "BP-100", "INV-100", "Purchase bill", "0", "10000", "0"],
+    ], columns=_EDGE_COLS)
+    o = standardize(seller, _EDGE_MAPPING_SELLER, role="seller")
+    t = standardize(buyer, _EDGE_MAPPING_BUYER, role="buyer")
+    r = reconcile(o, t)
+
+    # The invoice matches; the TDS journal row is missing in theirs.
+    check("TDS: invoice matched at L1", r.summary["matched_l1"] == 1, f"{r.summary['matched_l1']}")
+    check("TDS: journal row is missing in theirs", r.summary["missing_in_theirs"] == 1,
+          f"{r.summary['missing_in_theirs']}")
+
+    tds = classify_tds_entries(
+        missing_in_theirs=r.missing_in_theirs,
+        missing_in_ours=r.missing_in_ours,
+        our_full_ledger=r.our_ledger,
+        their_full_ledger=r.their_ledger,
+    )
+    check("TDS: journal row flagged", len(tds.flagged_entries) == 1, f"{len(tds.flagged_entries)}")
+
+    our_final, their_final = apply_tds_reclassification(r.our_ledger, r.their_ledger, tds)
+    tds_code = REC_CODES["TDS_ENTRY"]
+    n_reclassified = int((our_final["Rec Code"] == tds_code).sum())
+    check("TDS: row reclassified MISSING -> TDS_ENTRY in Rec Code", n_reclassified == 1,
+          f"got {n_reclassified}")
+    check("TDS: reclassified row has explanatory Notes",
+          our_final.loc[our_final["Rec Code"] == tds_code, "Notes"].astype(str).str.len().gt(0).all()
+          if n_reclassified else False)
 
 
 if __name__ == "__main__":

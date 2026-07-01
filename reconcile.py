@@ -245,6 +245,13 @@ def reconcile(
     ours.loc[ours["_match_idx"] == -1, "_rec_code"] = REC_CODES["MISSING_THEIRS"]
     theirs.loc[theirs["_match_idx"] == -1, "_rec_code"] = REC_CODES["MISSING_OURS"]
 
+    # Publish the internal codes into the canonical "Rec Code" column that the
+    # standardized-ledger export and the TDS post-processor consume. Without this
+    # the exported "Rec Code" is blank and apply_tds_reclassification (which
+    # filters on Rec Code == MISSING_*) silently does nothing.
+    ours["Rec Code"] = ours["_rec_code"]
+    theirs["Rec Code"] = theirs["_rec_code"]
+
     # ---------------- CALCULATE METRICS ----------------
     sum_ours = ours["Gross Amount"].sum()
     sum_theirs = theirs["Gross Amount"].sum()
@@ -294,7 +301,8 @@ def reconcile(
     }
 
     # Extract clean dataframes for the UI/Excel report
-    display_cols = ["Date", "Voucher Type", "Invoice Ref", "Description", "Gross Amount", "TDS Amount", "_rec_code", "_rec_id"]
+    # "Voucher No" is required by apply_tds_reclassification's row-matching mask.
+    display_cols = ["Date", "Voucher Type", "Voucher No", "Invoice Ref", "Description", "Gross Amount", "TDS Amount", "_rec_code", "_rec_id"]
     
     # Amount Mismatches (Join them side-by-side)
     am_ours = ours[ours["_rec_code"] == REC_CODES["AMOUNT_MISMATCH"]].copy()
@@ -355,7 +363,7 @@ def reconcile(
     missing_ours_df = theirs[theirs["_rec_code"] == REC_CODES["MISSING_OURS"]][display_cols].copy()
 
     # Cleanup temp columns
-    drop_cols = ["_internal_id", "_match_idx"]
+    drop_cols = ["_internal_id", "_match_idx", "_rec_code", "_rec_id", "_match_level"]
     ours = ours.drop(columns=[c for c in drop_cols if c in ours.columns])
     theirs = theirs.drop(columns=[c for c in drop_cols if c in theirs.columns])
 
