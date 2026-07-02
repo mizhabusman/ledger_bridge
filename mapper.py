@@ -23,6 +23,7 @@ from config import (
     CLAUDE_MODEL,
     MAPPING_SAMPLE_ROWS,
     CACHE_DIR,
+    MAPPING_CACHE_VERSION,
 )
 from ingest import get_column_fingerprint
 
@@ -196,17 +197,26 @@ def save_confirmed_analysis(df: pd.DataFrame, analysis: dict) -> None:
 def _write_cache(fingerprint: str, analysis: dict) -> None:
     cache_path = Path(CACHE_DIR) / f"{_safe_filename(fingerprint)}.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(analysis, indent=2))
+    # Stamp the version (on a copy) so stale caches are invalidated on read.
+    payload = dict(analysis)
+    payload["_cache_version"] = MAPPING_CACHE_VERSION
+    cache_path.write_text(json.dumps(payload, indent=2))
 
 
 def _load_cached(fingerprint: str) -> dict | None:
     cache_path = Path(CACHE_DIR) / f"{_safe_filename(fingerprint)}.json"
-    if cache_path.exists():
-        try:
-            return json.loads(cache_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return None
-    return None
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    # Ignore caches written under an older prompt/schema version — re-analyse
+    # (and overwrite the same file) rather than silently reuse a stale mapping.
+    if data.get("_cache_version") != MAPPING_CACHE_VERSION:
+        return None
+    data.pop("_cache_version", None)
+    return data
 
 
 def _safe_filename(s: str) -> str:

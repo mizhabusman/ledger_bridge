@@ -123,6 +123,12 @@ MAPPING_SAMPLE_ROWS = 8
 # Cache directory for confirmed mappings (keyed by column fingerprint)
 CACHE_DIR = "cache"
 
+# Cached mappings are stamped with this version. BUMP IT whenever the mapping
+# prompt or the canonical schema changes, so a ledger layout seen under an older
+# prompt is re-analysed instead of silently reusing a stale mapping. (v2 drops
+# the removed buyer/seller "role" schema; v1/unstamped caches are invalidated.)
+MAPPING_CACHE_VERSION = 2
+
 # ─────────────────────────── API pricing ────────────────────────────────────
 # Claude API pricing (USD per 1 million tokens). Update if Anthropic changes rates.
 # Source: https://www.anthropic.com/pricing  (check periodically)
