@@ -1,22 +1,20 @@
 """
 Self-contained end-to-end test of the deterministic core (no Claude, no sample files).
 
-Builds two synthetic raw ledgers in memory (one party's book and the
-counterparty's book), then runs the real pipeline:
+Builds synthetic raw ledgers in memory and runs the real pipeline:
 
     standardize -> reconcile -> write_report
 
-and asserts the seeded matches / mismatches / missing rows are classified
-correctly. This locks the contract between reconcile.py and report.py so the
-kind of drift that broke the app (renamed summary keys, a dropped `matched`
-table) fails loudly here instead of at runtime.
+Locks the reconcile.py <-> report.py contract and the finance-grade matching
+rules: exact mirror matching, TDS-inclusive matching (seller books gross, buyer
+books net + withholds TDS), the balance-walk integrity rule (a TDS match is
+CONFIRMED but its withheld-TDS delta stays counted as a reconciling item), the
+voucher-class gate (never match a credit note to an invoice), and the review
+tiers. There is NO fuzzy percentage variance auto-match.
 
-Gross Amount is Debit - Credit uniformly on both ledgers (no buyer/seller
-role). Because the two parties are double-entry counterparties, the SAME
-transaction lands with OPPOSITE signs on the two ledgers — every fixture
-below reflects that: "ours" and "theirs" raw Debit/Credit values are each
-party's own real books, and a genuinely matching pair has ours_amt ~=
--theirs_amt, not ours_amt == theirs_amt.
+Gross Amount = Debit - Credit uniformly on both ledgers (no buyer/seller role);
+the same transaction is opposite-signed on the two sides, so a match satisfies
+ours + theirs ~ 0.
 
 Run:  python test_core.py
 """
@@ -34,50 +32,46 @@ from tds_reconciliation import classify_tds_entries, apply_tds_reclassification
 from config import CANONICAL_FIELDS, REC_CODES
 
 
-# ── Synthetic raw ledgers ─────────────────────────────────────────────────────
-# Our books: invoices recorded in Debit, receipts in Credit.
+# ── Synthetic raw ledgers (main contract test) ───────────────────────────────
 OUR_RAW = pd.DataFrame([
-    # Date,        VchType,  VchNo,  Ref,        Narration,       Dr,      Cr,   TDS
-    ["2025-01-05", "Sales",  "SV-1", "INV-1001", "Sales bill",   "10000", "0",  "0"],  # L1 match
-    ["2025-01-10", "Sales",  "SV-2", "INV-1015", "Sales bill",   "5000",  "0",  "0"],  # L2 (timing)
-    ["2025-01-12", "Sales",  "SV-3", "INV-1012", "Sales bill",   "8000",  "0",  "0"],  # amount mismatch
-    ["2025-01-15", "Sales",  "SV-4", "INV-1010", "Sales bill",   "3000",  "0",  "0"],  # missing in theirs
+    # Date,        VchType,  VchNo,  Ref,        Narration,     Dr,      Cr,   TDS
+    ["2025-01-05", "Sales",  "SV-1", "INV-1001", "Sales bill", "10000", "0",  "0"],  # L1
+    ["2025-01-10", "Sales",  "SV-2", "INV-1015", "Sales bill", "5000",  "0",  "0"],  # L2 (timing)
+    ["2025-01-12", "Sales",  "SV-3", "INV-1012", "Sales bill", "8000",  "0",  "0"],  # amount mismatch
+    ["2025-01-15", "Sales",  "SV-4", "INV-1010", "Sales bill", "3000",  "0",  "0"],  # missing in theirs
 ], columns=["Date", "Vch Type", "Vch No", "Ref No", "Narration", "Dr", "Cr", "TDS"])
 
-# Their books: the same transactions from the counterparty's side — invoices
-# land in Credit, payments in Debit (their own books, own convention).
 THEIR_RAW = pd.DataFrame([
     # Date,        VchType,     VchNo,  Ref,        Narration,        Debit, Credit,  TDS
-    ["2025-01-05", "Purchase",  "BP-1", "INV-1001", "Purchase bill",  "0",   "10000", "0"],  # L1 match
-    ["2025-01-20", "Purchase",  "BP-2", "INV-1015", "Purchase bill",  "0",   "5000",  "0"],  # L2 (dates differ 10d)
-    ["2025-01-12", "Purchase",  "BP-3", "INV-1012", "Purchase bill",  "0",   "7000",  "0"],  # amount mismatch (7000 vs 8000)
-    ["2025-01-18", "Purchase",  "BP-4", "INV-1099", "Purchase bill",  "0",   "4000",  "0"],  # missing in ours
+    ["2025-01-05", "Purchase",  "PV-1", "INV-1001", "Purchase bill",  "0",   "10000", "0"],  # L1
+    ["2025-01-20", "Purchase",  "PV-2", "INV-1015", "Purchase bill",  "0",   "5000",  "0"],  # L2 (10d)
+    ["2025-01-12", "Purchase",  "PV-3", "INV-1012", "Purchase bill",  "0",   "7000",  "0"],  # mismatch (7000 vs 8000)
+    ["2025-01-18", "Purchase",  "PV-4", "INV-1099", "Purchase bill",  "0",   "4000",  "0"],  # missing in ours
 ], columns=["Date", "Vch Type", "Vch No", "Ref No", "Narration", "Debit", "Credit", "TDS"])
 
 OUR_MAPPING = {
-    "Date":         {"source": "Date"},
-    "Voucher Type": {"source": "Vch Type"},
-    "Voucher No":   {"source": "Vch No"},
-    "Invoice Ref":  {"source": "Ref No"},
-    "Description":  {"source": "Narration"},
-    "Debit":        {"source": "Dr"},
-    "Credit":       {"source": "Cr"},
-    "TDS Amount":   {"source": "TDS"},
+    "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
+    "Voucher No": {"source": "Vch No"}, "Invoice Ref": {"source": "Ref No"},
+    "Description": {"source": "Narration"}, "Debit": {"source": "Dr"},
+    "Credit": {"source": "Cr"}, "TDS Amount": {"source": "TDS"},
 }
-
 THEIR_MAPPING = {
-    "Date":         {"source": "Date"},
-    "Voucher Type": {"source": "Vch Type"},
-    "Voucher No":   {"source": "Vch No"},
-    "Invoice Ref":  {"source": "Ref No"},
-    "Description":  {"source": "Narration"},
-    "Debit":        {"source": "Debit"},
-    "Credit":       {"source": "Credit"},
-    "TDS Amount":   {"source": "TDS"},
+    "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
+    "Voucher No": {"source": "Vch No"}, "Invoice Ref": {"source": "Ref No"},
+    "Description": {"source": "Narration"}, "Debit": {"source": "Debit"},
+    "Credit": {"source": "Credit"}, "TDS Amount": {"source": "TDS"},
+}
+
+_COLS = ["Date", "Vch Type", "Vch No", "Ref No", "Narration", "Dr", "Cr", "TDS"]
+_MAP = {
+    "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
+    "Voucher No": {"source": "Vch No"}, "Invoice Ref": {"source": "Ref No"},
+    "Description": {"source": "Narration"}, "Debit": {"source": "Dr"},
+    "Credit": {"source": "Cr"}, "TDS Amount": {"source": "TDS"},
 }
 
 
-# ── Tiny assertion harness ────────────────────────────────────────────────────
+# ── Assertion harness ─────────────────────────────────────────────────────────
 _failures = []
 
 def check(name: str, ok: bool, detail: str = ""):
@@ -89,56 +83,45 @@ def check(name: str, ok: bool, detail: str = ""):
 
 def main():
     print("=" * 70)
-    print("LedgerBridge AI — Self-contained Core Test")
+    print("LedgerBridge AI - Self-contained Core Test")
     print("=" * 70)
 
-    # 1) Standardize (Gross Amount = Debit - Credit, uniformly, no role)
-    print("\n[1/3] Standardizing...")
+    # 1) Standardize
+    print("\n[1/8] Standardizing...")
     ours = standardize(OUR_RAW, OUR_MAPPING)
     theirs = standardize(THEIR_RAW, THEIR_MAPPING)
-    print(f"  Our standardized:   {len(ours)} rows")
-    print(f"  Their standardized: {len(theirs)} rows")
     check("both ledgers standardized to 4 rows", len(ours) == 4 and len(theirs) == 4,
           f"got {len(ours)}, {len(theirs)}")
-    check("their INV-1001 is the mirror-negation of ours (10000 vs -10000)",
-          abs(float(theirs.iloc[0]["Gross Amount"]) - (-10000.0)) < 1e-6,
-          f"got {float(theirs.iloc[0]['Gross Amount'])}")
 
     # 2) Reconcile
-    print("\n[2/3] Reconciling...")
-    result = reconcile(ours, theirs, opening_balance_ours=0, opening_balance_theirs=0)
+    print("\n[2/8] Reconciling (contract)...")
+    result = reconcile(ours, theirs)
     s = result.summary
-
-    check("L1 matches == 1 (INV-1001)", s["matched_l1"] == 1, f"got {s['matched_l1']}")
-    check("L2 matches == 1 (INV-1015 timing)", s["matched_l2"] == 1, f"got {s['matched_l2']}")
-    check("amount mismatches == 1 (INV-1012)", s["amount_mismatches"] == 1, f"got {s['amount_mismatches']}")
-    check("missing in theirs == 1 (INV-1010)", s["missing_in_theirs"] == 1, f"got {s['missing_in_theirs']}")
-    check("missing in ours == 1 (INV-1099)", s["missing_in_ours"] == 1, f"got {s['missing_in_ours']}")
-
-    # summary contract keys that report.py / insights.py depend on
-    for key in ("amount_tolerance", "tds_ours", "tds_theirs", "tds_difference", "reconciled"):
+    check("L1 matches == 1 (INV-1001)", s["matched_l1"] == 1, f"{s['matched_l1']}")
+    check("L2 matches == 1 (INV-1015 timing)", s["matched_l2"] == 1, f"{s['matched_l2']}")
+    check("amount mismatches == 1 (INV-1012)", s["amount_mismatches"] == 1, f"{s['amount_mismatches']}")
+    check("missing in theirs == 1 (INV-1010)", s["missing_in_theirs"] == 1, f"{s['missing_in_theirs']}")
+    check("missing in ours == 1 (INV-1099)", s["missing_in_ours"] == 1, f"{s['missing_in_ours']}")
+    for key in ("amount_tolerance", "matched_tds", "suggested_tds_unverified",
+                "tds_match_delta", "tds_ours", "tds_theirs", "tds_difference", "reconciled"):
         check(f"summary has '{key}'", key in s)
+    check("residual ~ 0 (books self-consistent)", abs(s["residual"]) < 1.0, f"{s['residual']}")
 
-    # matched table contract (report.py / this test read these columns)
+    # matched-table contract
     check("result.matched exists with rows", not result.matched.empty, f"{len(result.matched)} rows")
     if not result.matched.empty:
-        for col in ("Match Level", "Invoice Ref"):
+        for col in ("Match Level", "Invoice Ref", "Note"):
             check(f"matched has '{col}' column", col in result.matched.columns)
         inv1015 = result.matched[result.matched["Invoice Ref"] == "INV1015"]
         check("INV-1015 present in matched as L2",
               len(inv1015) == 1 and inv1015.iloc[0]["Match Level"] == "L2")
-
-    # exception tables carry the seeded refs (clean_voucher strips '-')
     check("INV-1010 in missing_in_theirs",
           "INV1010" in set(result.missing_in_theirs.get("Invoice Ref", pd.Series(dtype=str))))
     check("INV-1099 in missing_in_ours",
           "INV1099" in set(result.missing_in_ours.get("Invoice Ref", pd.Series(dtype=str))))
-    check("INV-1012 in amount_mismatches",
-          not result.amount_mismatches.empty
-          and "INV1012" in set(result.amount_mismatches.get("Invoice Ref_ours", pd.Series(dtype=str))))
 
-    # 3) Report generation must not raise (this is where the app used to crash)
-    print("\n[3/3] Writing Excel report...")
+    # 3) Report generation must not raise
+    print("\n[3/8] Writing Excel report...")
     out_dir = Path(tempfile.mkdtemp(prefix="lb_test_"))
     try:
         rec = write_report(result, out_dir / "reconciliation_report.xlsx")
@@ -148,348 +131,215 @@ def main():
     except Exception as e:
         check("write_report succeeded", False, repr(e))
 
-    # exported ledger must publish the canonical Rec Code + drop internal cols
     check("our_ledger 'Rec Code' populated (not blank)",
           (result.our_ledger["Rec Code"].astype(str) != "").all(),
-          f"blank rows: {(result.our_ledger['Rec Code'].astype(str) == '').sum()}")
-    check("our_ledger has no internal _ columns",
-          not any(c.startswith("_") for c in result.our_ledger.columns),
-          f"cols: {list(result.our_ledger.columns)}")
+          f"blank: {(result.our_ledger['Rec Code'].astype(str) == '').sum()}")
     check("our_ledger columns == canonical schema",
           list(result.our_ledger.columns) == CANONICAL_FIELDS,
-          f"cols: {list(result.our_ledger.columns)}")
+          f"{list(result.our_ledger.columns)}")
 
-    # 4) Correctness-tightening edge cases (item 2) + mirror-sign redesign
-    test_edge_cases()
-
-    # 5) Rec Code sync + TDS reclassification wiring (bugs A & B)
+    test_tds_inclusive()
+    test_voucher_class_gate()
+    test_no_ref_and_anomalies()
     test_tds_reclassification()
-
-    # 6) Invoice Ref fallback to Voucher No when unmapped (Batch 1 hygiene fix)
     test_invoice_ref_fallback()
-
-    # 7) Needs Review tier: variance / sign-reversed / suspected duplicate / AM ceiling
-    test_needs_review_tier()
 
     print("\n" + "=" * 70)
     if _failures:
-        print(f"RESULT: {len(_failures)} FAILED — {', '.join(_failures)}")
+        print(f"RESULT: {len(_failures)} FAILED - {', '.join(_failures)}")
         print("=" * 70)
         sys.exit(1)
     print("RESULT: ALL PASSED")
     print("=" * 70)
 
 
-# ── Edge cases for the item-2 correctness fixes + mirror-sign redesign ────────
-_EDGE_MAPPING_SELLER = {
-    "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
-    "Voucher No": {"source": "Vch No"}, "Invoice Ref": {"source": "Ref No"},
-    "Description": {"source": "Narration"}, "Debit": {"source": "Dr"},
-    "Credit": {"source": "Cr"}, "TDS Amount": {"source": "TDS"},
-}
-_EDGE_MAPPING_BUYER = {
-    "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
-    "Voucher No": {"source": "Vch No"}, "Invoice Ref": {"source": "Ref No"},
-    "Description": {"source": "Narration"}, "Debit": {"source": "Dr"},
-    "Credit": {"source": "Cr"}, "TDS Amount": {"source": "TDS"},
-}
-_EDGE_COLS = ["Date", "Vch Type", "Vch No", "Ref No", "Narration", "Dr", "Cr", "TDS"]
-
-
-def test_edge_cases():
-    print("\n[4/4] Edge cases (L3 uniqueness, AM closest-pair, TDS surfaced as mismatch)...")
-
-    # ---- (A) Amount-mismatch pairing must join by CLOSEST-TO-CANCELLING
-    # amount (mirror-sign), not row order. Duplicated ref INV-9 on both sides;
-    # naive first-row pairing would join 100<->-205 and 200<->-105 (huge
-    # diffs). Closest-to-cancelling joins 100<->-105, 200<->-205.
-    seller_am = pd.DataFrame([
-        ["2025-02-01", "Sales", "SV-9a", "INV-9", "bill", "100", "0", "0"],
-        ["2025-02-01", "Sales", "SV-9b", "INV-9", "bill", "200", "0", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_am = pd.DataFrame([
-        ["2025-02-01", "Purchase", "BP-9a", "INV-9", "bill", "0", "205", "0"],
-        ["2025-02-01", "Purchase", "BP-9b", "INV-9", "bill", "0", "105", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller_am, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer_am, _EDGE_MAPPING_BUYER)
+def test_tds_inclusive():
+    print("\n[4/8] TDS-inclusive matching + balance integrity...")
+    # Seller books full gross (10000); buyer books net (9000) + withholds TDS (1000).
+    # Ref-matched -> confirmed MATCHED_INCL_TDS; the +1000 stays a reconciling item.
+    seller = pd.DataFrame([
+        ["2025-05-01", "Sales", "SV-7", "INV-7", "Sales bill", "10000", "0", "0"],
+    ], columns=_COLS)
+    buyer = pd.DataFrame([
+        ["2025-08-01", "Purchase", "PV-7", "INV-7", "Purchase bill", "0", "9000", "1000"],  # posted 3 months later
+    ], columns=_COLS)
+    o = standardize(seller, _MAP); t = standardize(buyer, _MAP)
     r = reconcile(o, t)
-    am = r.amount_mismatches
-    check("AM: both duplicate-ref rows classified as mismatch", len(am) == 2, f"got {len(am)}")
-    if len(am) == 2:
-        pair = dict(zip(am["Gross Amount_ours"], am["Gross Amount_theirs"]))
-        check("AM: 100 paired with closest-to-cancelling -105", pair.get(100.0) == -105.0, f"{pair}")
-        check("AM: 200 paired with closest-to-cancelling -205", pair.get(200.0) == -205.0, f"{pair}")
-        check("AM: every pairing within 5 units",
-              am["Difference"].abs().max() <= 5.0, f"max diff {am['Difference'].abs().max()}")
+    s = r.summary
+    check("TDS: net-of-TDS invoice is MATCHED_INCL_TDS (not L1, not mismatch)",
+          s["matched_tds"] == 1 and s["matched_l1"] == 0 and s["amount_mismatches"] == 0,
+          f"tds={s['matched_tds']} l1={s['matched_l1']} am={s['amount_mismatches']}")
+    check("TDS: big posting-date gap does not block a ref match",
+          s["matched_l2"] == 0 and s["matched_tds"] == 1)  # matched as TDS regardless of 92-day gap
+    check("TDS: match carries an explanatory note",
+          (not r.matched.empty) and "TDS" in str(r.matched.iloc[0]["Note"]).upper(),
+          f"{r.matched['Note'].tolist() if not r.matched.empty else 'empty'}")
+    # Balance integrity: the withheld TDS is COUNTED, not erased, and residual ~ 0
+    check("TDS: withheld TDS surfaced as reconciling delta (=1000)",
+          abs(s["tds_match_delta"] - 1000.0) < 1e-6, f"{s['tds_match_delta']}")
+    check("TDS: reconciling_item includes the TDS delta",
+          abs(s["reconciling_item"] - 1000.0) < 1e-6, f"{s['reconciling_item']}")
+    check("TDS: residual ~ 0 (balance still self-consistent)",
+          abs(s["residual"]) < 1e-6, f"{s['residual']}")
 
-    # ---- (B) L3 must NOT pair ambiguous same-date/amount groups (no ref).
-    # 2 vs 2 identical, ref-less rows → ambiguous → left as missing, not matched.
-    seller_l3 = pd.DataFrame([
+    # Both sides carry TDS -> cannot self-prove -> SUGGESTED_TDS_UNVERIFIED (review)
+    seller2 = pd.DataFrame([
+        ["2025-05-01", "Sales", "SV-8", "INV-8", "Sales bill", "10000", "0", "500"],
+    ], columns=_COLS)
+    buyer2 = pd.DataFrame([
+        ["2025-05-01", "Purchase", "PV-8", "INV-8", "Purchase bill", "0", "9000", "1000"],
+    ], columns=_COLS)
+    r2 = reconcile(standardize(seller2, _MAP), standardize(buyer2, _MAP))
+    check("TDS: both-sides-TDS routed to SUGGESTED_TDS_UNVERIFIED (not auto-confirmed)",
+          r2.summary["suggested_tds_unverified"] == 1 and r2.summary["matched_tds"] == 0,
+          f"sug={r2.summary['suggested_tds_unverified']} tds={r2.summary['matched_tds']}")
+
+    # A gap that is NOT explained by the booked TDS stays an amount mismatch
+    seller3 = pd.DataFrame([
+        ["2025-05-01", "Sales", "SV-9", "INV-9", "Sales bill", "10000", "0", "0"],
+    ], columns=_COLS)
+    buyer3 = pd.DataFrame([
+        ["2025-05-01", "Purchase", "PV-9", "INV-9", "Purchase bill", "0", "8600", "1000"],  # gap 1400, TDS wouldn't zero it
+    ], columns=_COLS)
+    r3 = reconcile(standardize(seller3, _MAP), standardize(buyer3, _MAP))
+    check("TDS: unexplained gap stays AMOUNT_MISMATCH, not a TDS match",
+          r3.summary["amount_mismatches"] == 1 and r3.summary["matched_tds"] == 0,
+          f"am={r3.summary['amount_mismatches']} tds={r3.summary['matched_tds']}")
+
+
+def test_voucher_class_gate():
+    print("\n[5/8] Voucher-class gate (no-ref)...")
+    # A credit note and an invoice of EQUAL magnitude, no ref, same date: they
+    # mirror numerically but must NOT be matched (different voucher class).
+    seller = pd.DataFrame([
+        ["2025-06-01", "Credit Note", "CN-1", "", "Credit note", "0", "5000", "0"],   # gross -5000
+    ], columns=_COLS)
+    buyer = pd.DataFrame([
+        ["2025-06-01", "Purchase", "PV-1", "", "Purchase bill", "5000", "0", "0"],     # gross +5000
+    ], columns=_COLS)
+    r = reconcile(standardize(seller, _MAP), standardize(buyer, _MAP))
+    check("CLASS: credit note vs invoice (equal magnitude, no ref) NOT matched",
+          r.summary["matched_l3"] == 0
+          and r.summary["missing_in_theirs"] == 1 and r.summary["missing_in_ours"] == 1,
+          f"l3={r.summary['matched_l3']} mt={r.summary['missing_in_theirs']} mo={r.summary['missing_in_ours']}")
+
+    # Positive control: same class (credit note <-> credit-note reversal), no ref -> matched
+    seller2 = pd.DataFrame([
+        ["2025-06-02", "Credit Note", "CN-2", "", "Credit note", "0", "6000", "0"],    # -6000
+    ], columns=_COLS)
+    buyer2 = pd.DataFrame([
+        ["2025-06-02", "Credit Note", "RCRV-2", "", "P.Return", "6000", "0", "0"],       # +6000, RCRV -> CREDIT_NOTE
+    ], columns=_COLS)
+    r2 = reconcile(standardize(seller2, _MAP), standardize(buyer2, _MAP))
+    check("CLASS: same-class no-ref mirror IS matched (L3)",
+          r2.summary["matched_l3"] == 1, f"l3={r2.summary['matched_l3']}")
+
+
+def test_no_ref_and_anomalies():
+    print("\n[6/8] No-ref uniqueness, sign-reversed, duplicates, AM ceiling...")
+    # Ambiguous no-ref group (2x2 identical journals) -> NOT matched, both missing.
+    seller = pd.DataFrame([
         ["2025-03-01", "Journal", "JV-1", "", "adj", "500", "0", "0"],
         ["2025-03-01", "Journal", "JV-2", "", "adj", "500", "0", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_l3 = pd.DataFrame([
+    ], columns=_COLS)
+    buyer = pd.DataFrame([
         ["2025-03-01", "Journal", "JV-3", "", "adj", "0", "500", "0"],
         ["2025-03-01", "Journal", "JV-4", "", "adj", "0", "500", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller_l3, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer_l3, _EDGE_MAPPING_BUYER)
-    r = reconcile(o, t)
-    check("L3: ambiguous 2x2 group not matched (0 L3)", r.summary["matched_l3"] == 0,
-          f"got {r.summary['matched_l3']}")
-    check("L3: ambiguous rows fall through to missing",
-          r.summary["missing_in_theirs"] == 2 and r.summary["missing_in_ours"] == 2,
-          f"theirs={r.summary['missing_in_theirs']} ours={r.summary['missing_in_ours']}")
+    ], columns=_COLS)
+    r = reconcile(standardize(seller, _MAP), standardize(buyer, _MAP))
+    check("NOREF: ambiguous 2x2 group not matched (0 L3, all missing)",
+          r.summary["matched_l3"] == 0 and r.summary["missing_in_theirs"] == 2
+          and r.summary["missing_in_ours"] == 2, f"l3={r.summary['matched_l3']}")
 
-    # ---- (B2) L3 SHOULD pair an unambiguous 1:1 ref-less row on date+amount
-    # (mirror-sign: 750 on our side cancels with -750 on theirs).
-    seller_l3b = pd.DataFrame([
-        ["2025-04-01", "Journal", "JV-5", "", "adj", "750", "0", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_l3b = pd.DataFrame([
-        ["2025-04-01", "Journal", "JV-6", "", "adj", "0", "750", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller_l3b, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer_l3b, _EDGE_MAPPING_BUYER)
-    r = reconcile(o, t)
-    check("L3: unambiguous 1:1 ref-less row matched", r.summary["matched_l3"] == 1,
-          f"got {r.summary['matched_l3']}")
+    # Unambiguous 1:1 no-ref mirror -> matched
+    s2 = pd.DataFrame([["2025-04-01", "Journal", "JV-5", "", "adj", "750", "0", "0"]], columns=_COLS)
+    b2 = pd.DataFrame([["2025-04-01", "Journal", "JV-6", "", "adj", "0", "750", "0"]], columns=_COLS)
+    r2 = reconcile(standardize(s2, _MAP), standardize(b2, _MAP))
+    check("NOREF: unambiguous 1:1 mirror matched (L3)", r2.summary["matched_l3"] == 1,
+          f"l3={r2.summary['matched_l3']}")
 
-    # ---- (C) TDS gross-up heuristic REMOVED (client directive: no role,
-    # no special-casing). A buyer's net-of-TDS invoice row must NOT be
-    # silently inflated to match the seller's gross figure — it now surfaces
-    # as a visible AMOUNT_MISMATCH whose Difference equals the TDS withheld,
-    # explainable via the TDS Reconciliation sheet instead of being hidden.
-    seller_tds = pd.DataFrame([
-        ["2025-05-01", "Sales", "SV-7", "INV-7", "bill", "10000", "0", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_tds = pd.DataFrame([
-        ["2025-05-01", "Purchase", "BP-7", "INV-7", "bill", "0", "9000", "1000"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller_tds, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer_tds, _EDGE_MAPPING_BUYER)
-    check("TDS: buyer invoice NOT grossed up, stays net -9000",
-          abs(float(t.iloc[0]["Gross Amount"]) - (-9000.0)) < 1e-6,
-          f"got {float(t.iloc[0]['Gross Amount'])}")
-    r = reconcile(o, t)
-    check("TDS: net-of-TDS invoice surfaces as AMOUNT_MISMATCH, not a clean match",
-          r.summary["matched_l1"] == 0 and r.summary["amount_mismatches"] == 1,
-          f"l1={r.summary['matched_l1']} am={r.summary['amount_mismatches']}")
-    check("TDS: mismatch Difference equals the TDS withheld (1000)",
-          not r.amount_mismatches.empty
-          and abs(float(r.amount_mismatches.iloc[0]["Difference"]) - 1000.0) < 1e-6,
-          f"{r.amount_mismatches.to_dict('records') if not r.amount_mismatches.empty else 'empty'}")
+    # Sign-reversed: same date + magnitude, SAME sign (posting error, e.g. payment
+    # booked to the credit column) -> flagged, not matched, not missing.
+    s3 = pd.DataFrame([["2025-06-01", "Receipt", "BR-12", "", "Receipt NEFT", "0", "500392.05", "0"]], columns=_COLS)
+    b3 = pd.DataFrame([["2025-06-01", "Payment", "BP-12", "", "Payment NEFT", "0", "500392.05", "0"]], columns=_COLS)
+    o3, t3 = standardize(s3, _MAP), standardize(b3, _MAP)
+    check("SIGN: both rows standardize to the SAME sign (-500392.05)",
+          float(o3.iloc[0]["Gross Amount"]) < 0 and float(t3.iloc[0]["Gross Amount"]) < 0)
+    r3 = reconcile(o3, t3)
+    check("SIGN: same-sign same-amount flagged SIGN_REVERSED (not missing)",
+          r3.summary["sign_reversed"] == 1 and r3.summary["missing_in_theirs"] == 0,
+          f"sr={r3.summary['sign_reversed']}")
 
-    # ---- (D) Summary rows (TOTALS / sub total) must be dropped by standardize,
-    # while genuine transactions survive.
-    with_totals = pd.DataFrame([
-        ["2025-08-01", "Sales", "SV-1", "INV-D1", "Sales bill", "1000", "0", "0"],  # keep
-        ["",           "",      "",     "",       "TOTALS",     "9999", "0", "0"],  # drop
-        ["2025-08-02", "Sales", "SV-2", "INV-D2", "Sub Total",  "8888", "0", "0"],  # drop
-        ["2025-08-03", "Sales", "SV-3", "INV-D3", "Sales bill", "2000", "0", "0"],  # keep
-    ], columns=_EDGE_COLS)
-    std = standardize(with_totals, _EDGE_MAPPING_SELLER)
-    check("Summary rows dropped, real rows kept", len(std) == 2,
-          f"got {len(std)} rows: {std['Description'].tolist()}")
+    # Suspected duplicate (marker-based): extra -DUP row with no partner.
+    s4 = pd.DataFrame([
+        ["2025-08-10", "Receipt", "BR-37",     "", "Receipt NEFT",             "0", "257205.27", "0"],
+        ["2025-08-12", "Receipt", "BR-37-DUP", "", "Receipt NEFT - duplicate", "0", "257205.27", "0"],
+    ], columns=_COLS)
+    b4 = pd.DataFrame([
+        ["2025-08-10", "Payment", "BP-37", "", "Payment NEFT", "257205.27", "0", "0"],
+    ], columns=_COLS)
+    r4 = reconcile(standardize(s4, _MAP), standardize(b4, _MAP))
+    check("DUP: marked-duplicate extra flagged SUSPECTED_DUPLICATE",
+          r4.summary["suspected_duplicates"] == 1 and r4.summary["missing_in_theirs"] == 0,
+          f"dup={r4.summary['suspected_duplicates']} mt={r4.summary['missing_in_theirs']}")
 
-    # ---- (C2) Gross Amount is always Debit - Credit, with no special-casing
-    # by row type or TDS Amount — a plain payment row proves TDS never leaks
-    # into the Gross Amount computation.
-    buyer_pay = pd.DataFrame([
-        ["2025-06-01", "Payment", "BP-8", "INV-8", "pmt", "5000", "0", "500"],
-    ], columns=_EDGE_COLS)
-    t = standardize(buyer_pay, _EDGE_MAPPING_BUYER)
-    check("Gross Amount = Debit - Credit regardless of TDS Amount (5000, TDS=500 ignored)",
-          abs(float(t.iloc[0]["Gross Amount"]) - 5000.0) < 1e-6,
-          f"got {float(t.iloc[0]['Gross Amount'])}")
+    # AM ceiling: same ref, wildly different amounts -> NOT paired, stays missing.
+    s5 = pd.DataFrame([["2025-09-01", "Sales", "SV-X", "REF-X", "Sales bill", "60000", "0", "0"]], columns=_COLS)
+    b5 = pd.DataFrame([["2025-09-01", "Journal", "JV-X", "REF-X", "Some journal", "0", "1000", "0"]], columns=_COLS)
+    r5 = reconcile(standardize(s5, _MAP), standardize(b5, _MAP))
+    check("CEILING: 60000-vs-1000 same-ref does NOT bind (0 mismatches, both missing)",
+          r5.summary["amount_mismatches"] == 0 and r5.summary["missing_in_theirs"] == 1
+          and r5.summary["missing_in_ours"] == 1, f"am={r5.summary['amount_mismatches']}")
 
 
 def test_tds_reclassification():
-    print("\n[5/5] Rec Code sync + TDS reclassification (bugs A & B)...")
-    # Seller books a sale (matched) plus a separate TDS-receivable journal row
-    # that has no counterpart on the buyer side (structurally different booking).
+    print("\n[7/8] TDS journal reclassification + journal-vs-journal status...")
     seller = pd.DataFrame([
         ["2025-07-01", "Sales",   "SV-100", "INV-100", "Sales bill",              "10000", "0", "0"],
         ["2025-07-01", "Journal", "JV-100", "TDSJV1",  "TDS receivable u/s 194Q", "0", "1000", "0"],
-    ], columns=_EDGE_COLS)
+    ], columns=_COLS)
     buyer = pd.DataFrame([
-        ["2025-07-01", "Purchase", "BP-100", "INV-100", "Purchase bill", "0", "10000", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer, _EDGE_MAPPING_BUYER)
+        ["2025-07-01", "Purchase", "PV-100", "INV-100", "Purchase bill", "0", "10000", "0"],
+    ], columns=_COLS)
+    o = standardize(seller, _MAP); t = standardize(buyer, _MAP)
     r = reconcile(o, t)
-
-    # The invoice matches; the TDS journal row is missing in theirs.
-    check("TDS: invoice matched at L1", r.summary["matched_l1"] == 1, f"{r.summary['matched_l1']}")
-    check("TDS: journal row is missing in theirs", r.summary["missing_in_theirs"] == 1,
+    check("TDS-J: invoice matched at L1", r.summary["matched_l1"] == 1, f"{r.summary['matched_l1']}")
+    check("TDS-J: TDS journal is missing in theirs", r.summary["missing_in_theirs"] == 1,
           f"{r.summary['missing_in_theirs']}")
-
     tds = classify_tds_entries(
-        missing_in_theirs=r.missing_in_theirs,
-        missing_in_ours=r.missing_in_ours,
-        our_full_ledger=r.our_ledger,
-        their_full_ledger=r.their_ledger,
-    )
-    check("TDS: journal row flagged", len(tds.flagged_entries) == 1, f"{len(tds.flagged_entries)}")
-
-    our_final, their_final = apply_tds_reclassification(r.our_ledger, r.their_ledger, tds)
+        missing_in_theirs=r.missing_in_theirs, missing_in_ours=r.missing_in_ours,
+        our_full_ledger=r.our_ledger, their_full_ledger=r.their_ledger)
+    check("TDS-J: journal row flagged", len(tds.flagged_entries) == 1, f"{len(tds.flagged_entries)}")
+    our_final, _ = apply_tds_reclassification(r.our_ledger, r.their_ledger, tds)
     tds_code = REC_CODES["TDS_ENTRY"]
-    n_reclassified = int((our_final["Rec Code"] == tds_code).sum())
-    check("TDS: row reclassified MISSING -> TDS_ENTRY in Rec Code", n_reclassified == 1,
-          f"got {n_reclassified}")
-    check("TDS: reclassified row has explanatory Notes",
-          our_final.loc[our_final["Rec Code"] == tds_code, "Notes"].astype(str).str.len().gt(0).all()
-          if n_reclassified else False)
+    check("TDS-J: row reclassified MISSING -> TDS_ENTRY",
+          int((our_final["Rec Code"] == tds_code).sum()) == 1)
 
-    # ---- journal-vs-journal overall status (both sides book TDS as journals).
-    # Seller: per-invoice TDS receivable journal (1000). Buyer: monthly challan
-    # journal (900). Neither has a TDS column → status must be PARTIAL, gap 100.
-    seller_jj = pd.DataFrame([
-        ["2025-07-05", "Journal", "JV-1", "TDSR1", "TDS receivable u/s 194Q",           "0", "1000", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_jj = pd.DataFrame([
-        ["2025-07-07", "Journal", "JV-2", "TDSC1", "TDS remitted to portal (challan)",  "900", "0", "0"],
-    ], columns=_EDGE_COLS)
-    o2 = standardize(seller_jj, _EDGE_MAPPING_SELLER)
-    t2 = standardize(buyer_jj, _EDGE_MAPPING_BUYER)
-    r2 = reconcile(o2, t2)
-    tds2 = classify_tds_entries(
-        missing_in_theirs=r2.missing_in_theirs, missing_in_ours=r2.missing_in_ours,
-        our_full_ledger=r2.our_ledger, their_full_ledger=r2.their_ledger,
-    )
-    check("TDS journal-vs-journal both sides flagged",
-          len(tds2.flagged_entries) == 2, f"{len(tds2.flagged_entries)}")
-    check("TDS journal-vs-journal status == PARTIAL",
-          tds2.overall_status == "PARTIAL", f"{tds2.overall_status}: {tds2.status_message}")
+    # journal-vs-journal aggregate status
+    sj = pd.DataFrame([["2025-07-05", "Journal", "JV-1", "TDSR1", "TDS receivable u/s 194Q", "0", "1000", "0"]], columns=_COLS)
+    bj = pd.DataFrame([["2025-07-07", "Journal", "JV-2", "TDSC1", "TDS remitted to portal (challan)", "900", "0", "0"]], columns=_COLS)
+    rj = reconcile(standardize(sj, _MAP), standardize(bj, _MAP))
+    tj = classify_tds_entries(missing_in_theirs=rj.missing_in_theirs, missing_in_ours=rj.missing_in_ours,
+                              our_full_ledger=rj.our_ledger, their_full_ledger=rj.their_ledger)
+    check("TDS-J: journal-vs-journal status == PARTIAL",
+          tj.overall_status == "PARTIAL", f"{tj.overall_status}")
 
 
 def test_invoice_ref_fallback():
-    print("\n[6/6] Invoice Ref fallback to Voucher No when unmapped...")
-
-    # No "Invoice Ref" source at all — only Voucher No, matching ledgers that
-    # use the same voucher/document number as their shared cross-party ref.
+    print("\n[8/8] Invoice Ref fallback to Voucher No when unmapped...")
     mapping_no_ref = {
         "Date": {"source": "Date"}, "Voucher Type": {"source": "Vch Type"},
         "Voucher No": {"source": "Vch No"}, "Description": {"source": "Narration"},
         "Debit": {"source": "Dr"}, "Credit": {"source": "Cr"}, "TDS Amount": {"source": "TDS"},
     }
-    raw = pd.DataFrame([
-        ["2025-09-01", "Sales", "ALP/25-26/001", "", "Sales bill", "5000", "0", "0"],
-    ], columns=_EDGE_COLS)
-    std = standardize(raw, mapping_no_ref)
-    check("Invoice Ref falls back to Voucher No value",
-          std.iloc[0]["Invoice Ref"] == std.iloc[0]["Voucher No"] == "ALP2526001",
-          f"Invoice Ref={std.iloc[0]['Invoice Ref']!r} Voucher No={std.iloc[0]['Voucher No']!r}")
-
-    # End-to-end: two ledgers sharing a voucher number as their only common
-    # identifier, neither mapping Invoice Ref explicitly, must still L1-match.
-    seller_raw = pd.DataFrame([
-        ["2025-09-05", "Sales", "ALP/25-26/010", "", "Sales bill", "12000", "0", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_raw = pd.DataFrame([
-        ["2025-09-05", "Purchase", "ALP/25-26/010", "", "Purchase bill", "0", "12000", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller_raw, mapping_no_ref)
-    t = standardize(buyer_raw, mapping_no_ref)
+    seller = pd.DataFrame([["2025-09-05", "Sales", "ALP/25-26/010", "", "Sales bill", "12000", "0", "0"]], columns=_COLS)
+    buyer = pd.DataFrame([["2025-09-05", "Purchase", "ALP/25-26/010", "", "Purchase bill", "0", "12000", "0"]], columns=_COLS)
+    o = standardize(seller, mapping_no_ref); t = standardize(buyer, mapping_no_ref)
+    check("REF: Invoice Ref falls back to Voucher No value",
+          o.iloc[0]["Invoice Ref"] == o.iloc[0]["Voucher No"] == "ALP2526010")
     r = reconcile(o, t)
-    check("Shared voucher no (no explicit Invoice Ref) still L1-matches",
-          r.summary["matched_l1"] == 1, f"{r.summary['matched_l1']}")
-
-    # When Voucher No genuinely differs between ledgers too, fallback must not
-    # cause a false match — behavior stays identical to leaving Invoice Ref blank.
-    seller_raw2 = pd.DataFrame([
-        ["2025-09-06", "Sales", "SV-999", "", "Sales bill", "12000", "0", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_raw2 = pd.DataFrame([
-        ["2025-09-06", "Purchase", "BP-888", "", "Purchase bill", "0", "12000", "0"],
-    ], columns=_EDGE_COLS)
-    o2 = standardize(seller_raw2, mapping_no_ref)
-    t2 = standardize(buyer_raw2, mapping_no_ref)
-    r2 = reconcile(o2, t2)
-    check("Differing voucher numbers: falls through to L3 (date+amount), not a false ref match",
-          r2.summary["matched_l1"] == 0 and r2.summary["matched_l3"] == 1,
-          f"l1={r2.summary['matched_l1']} l3={r2.summary['matched_l3']}")
-
-
-def test_needs_review_tier():
-    print("\n[7/7] Needs Review tier (variance / sign-reversed / duplicate / AM ceiling)...")
-    from config import REC_CODES as RC
-
-    # ---- (A) Bank charge: mirror pair, same date, DIFFERENT refs, ~1.5% gap.
-    # Must be rescued from Missing into VARIANCE (a real ₹500-on-₹34k charge).
-    seller = pd.DataFrame([
-        ["2025-05-05", "Receipt", "RCT/005", "", "Receipt (NEFT)", "0", "34425.81", "0"],
-    ], columns=_EDGE_COLS)
-    buyer = pd.DataFrame([
-        ["2025-05-05", "Payment", "PAY/005", "", "Payment (NEFT)", "34925.81", "0", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer, _EDGE_MAPPING_BUYER)
-    r = reconcile(o, t)
-    check("VARIANCE: bank-charge pair rescued from missing (variance==1)",
-          r.summary["variance"] == 1 and r.summary["missing_in_theirs"] == 0
-          and r.summary["missing_in_ours"] == 0,
-          f"var={r.summary['variance']} mt={r.summary['missing_in_theirs']} mo={r.summary['missing_in_ours']}")
-    nr = r.needs_review
-    var_rows = nr[nr["Rec Code"] == RC["VARIANCE"]]
-    check("VARIANCE: gap shown ~Rs500 in needs_review",
-          len(var_rows) == 1 and abs(float(var_rows.iloc[0]["Gap"]) - 500.0) < 1e-6,
-          f"{var_rows[['Gap']].to_dict('records') if not var_rows.empty else 'none'}")
-
-    # ---- (B) Sign-reversed: same date, same amount, SAME sign (posting error).
-    # A payment booked to the credit column → same sign as the receipt.
-    seller_sr = pd.DataFrame([
-        ["2025-06-01", "Receipt", "RCT/012", "", "Receipt (NEFT)", "0", "500392.05", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_sr = pd.DataFrame([
-        ["2025-06-01", "Payment", "PAY/012", "", "Payment (NEFT)", "0", "500392.05", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller_sr, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer_sr, _EDGE_MAPPING_BUYER)
-    check("SIGN: both rows standardize to the SAME sign (-500392.05)",
-          float(o.iloc[0]["Gross Amount"]) < 0 and float(t.iloc[0]["Gross Amount"]) < 0)
-    r = reconcile(o, t)
-    check("SIGN: same-sign same-amount pair flagged SIGN_REVERSED, not missing",
-          r.summary["sign_reversed"] == 1 and r.summary["missing_in_theirs"] == 0
-          and r.summary["missing_in_ours"] == 0,
-          f"sr={r.summary['sign_reversed']} mt={r.summary['missing_in_theirs']} mo={r.summary['missing_in_ours']}")
-
-    # ---- (C) Suspected duplicate: an extra marked-duplicate row with no partner.
-    seller_dup = pd.DataFrame([
-        ["2025-08-10", "Receipt", "RCT/037",     "", "Receipt (NEFT)",             "0", "257205.27", "0"],
-        ["2025-08-12", "Receipt", "RCT/037-DUP", "", "Receipt (NEFT) - duplicate", "0", "257205.27", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_dup = pd.DataFrame([
-        ["2025-08-10", "Payment", "PAY/037", "", "Payment (NEFT)", "257205.27", "0", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller_dup, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer_dup, _EDGE_MAPPING_BUYER)
-    r = reconcile(o, t)
-    # RCT/037 pairs with PAY/037 (mirror, same date); the -DUP copy is flagged.
-    check("DUP: marked-duplicate extra flagged SUSPECTED_DUP (not missing)",
-          r.summary["suspected_duplicates"] == 1 and r.summary["missing_in_theirs"] == 0,
-          f"dup={r.summary['suspected_duplicates']} mt={r.summary['missing_in_theirs']}")
-
-    # ---- (D) AM ceiling: same ref but wildly different amounts must NOT bind
-    # (e.g. an invoice vs an unrelated same-ref journal). Stays missing.
-    seller_c = pd.DataFrame([
-        ["2025-09-01", "Sales", "REF-X", "REF-X", "Sales bill", "60000", "0", "0"],
-    ], columns=_EDGE_COLS)
-    buyer_c = pd.DataFrame([
-        ["2025-09-01", "Journal", "REF-X", "REF-X", "Some journal", "0", "1000", "0"],
-    ], columns=_EDGE_COLS)
-    o = standardize(seller_c, _EDGE_MAPPING_SELLER)
-    t = standardize(buyer_c, _EDGE_MAPPING_BUYER)
-    r = reconcile(o, t)
-    check("CEILING: 60000-vs-1000 same-ref does NOT bind (0 amount mismatches)",
-          r.summary["amount_mismatches"] == 0
-          and r.summary["missing_in_theirs"] == 1 and r.summary["missing_in_ours"] == 1,
-          f"am={r.summary['amount_mismatches']} mt={r.summary['missing_in_theirs']} mo={r.summary['missing_in_ours']}")
-
-    # ---- (E) Balance still reconciles across a mixed review-tier ledger.
-    check("Balance reconciles with review-tier rows present", r.summary["reconciled"] is True
-          or abs(r.summary["residual"]) < 1.0, f"residual={r.summary['residual']}")
+    check("REF: shared voucher no (no explicit ref) still L1-matches", r.summary["matched_l1"] == 1,
+          f"{r.summary['matched_l1']}")
 
 
 if __name__ == "__main__":

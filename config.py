@@ -48,8 +48,9 @@ REC_CODES = {
     "L1": "MATCHED_L1",
     "L2": "MATCHED_L2_TIMING",
     "L3": "MATCHED_L3_REVIEW",
+    "TDS_MATCH": "MATCHED_INCL_TDS",          # exact once counterparty's booked TDS added back
     "AMOUNT_MISMATCH": "AMOUNT_MISMATCH",
-    "VARIANCE": "MATCH_VARIANCE",             # paired, small variance (e.g. bank charge)
+    "TDS_UNVERIFIED": "SUGGESTED_TDS_UNVERIFIED",  # TDS-related but not exactly confirmable → review
     "SIGN_REVERSED": "SIGN_REVERSED_REVIEW",  # same amount+date, same sign (posting error)
     "SUSPECTED_DUP": "SUSPECTED_DUPLICATE",   # duplicate of another same-side row
     "MISSING_OURS": "MISSING_IN_OURS",
@@ -58,45 +59,53 @@ REC_CODES = {
     "TDS_ENTRY": "TDS_ENTRY_OTHER_SIDE",   # journal entry reconciled via TDS sheet
 }
 
-# Human-readable reasons for the "Needs Review" report section, keyed by rec code.
+# Codes that are CONFIRMED matches (shown in the Matched sheet). Note: not all of
+# these are "balance-neutral" — see BALANCE_NEUTRAL_CODES below.
+CONFIRMED_MATCH_CODES = ["MATCHED_L1", "MATCHED_L2_TIMING", "MATCHED_L3_REVIEW", "MATCHED_INCL_TDS"]
+
+# Codes whose gross ACTUALLY cancels with its partner (ours + theirs ≈ 0), so the
+# pair drops out of the balance walk. A TDS-inclusive match confirms the two rows
+# are the same invoice, but the pair nets to +TDS (the withheld tax the seller has
+# not booked per-invoice) — a REAL reconciling item — so MATCHED_INCL_TDS is
+# CONFIRMED but deliberately NOT balance-neutral.
+BALANCE_NEUTRAL_CODES = ["MATCHED_L1", "MATCHED_L2_TIMING", "MATCHED_L3_REVIEW"]
+
+# Human-readable reasons / notes, keyed by rec code.
 REC_REASONS = {
-    "AMOUNT_MISMATCH":       "Amount mismatch (same invoice ref, amounts differ)",
-    "MATCH_VARIANCE":        "Matched with variance (e.g. bank charge / short payment)",
-    "SIGN_REVERSED_REVIEW":  "Possible posting error (same amount & date, same sign)",
-    "SUSPECTED_DUPLICATE":   "Suspected duplicate (identical entry on the same side)",
+    "MATCHED_INCL_TDS":         "Matched after adding counterparty's withheld TDS",
+    "AMOUNT_MISMATCH":          "Amount mismatch (same invoice ref, amounts differ beyond TDS)",
+    "SUGGESTED_TDS_UNVERIFIED": "Possible TDS-related match — verify (both sides carry TDS)",
+    "SIGN_REVERSED_REVIEW":     "Possible posting error (same amount & date, same sign)",
+    "SUSPECTED_DUPLICATE":      "Suspected duplicate (identical entry on the same side)",
 }
 
-# The set of rec codes that make up the "Needs Review" tier (between a clean
+# The set of rec codes that make up the "Needs Review" tier (between a confirmed
 # match and a genuine "missing"). Order controls display order.
 NEEDS_REVIEW_CODES = [
-    "AMOUNT_MISMATCH", "MATCH_VARIANCE", "SIGN_REVERSED_REVIEW", "SUSPECTED_DUPLICATE",
+    "AMOUNT_MISMATCH", "SUGGESTED_TDS_UNVERIFIED", "SIGN_REVERSED_REVIEW", "SUSPECTED_DUPLICATE",
 ]
 
 # ─────────────────────────── matching tolerances ────────────────────────────
-# Two-band amount model (all comparisons are mirror-sign: a true pair satisfies
-# ours + theirs ≈ 0, so the "gap" is abs(ours + theirs)):
-#   - gap <= rounding_tolerance                → CLEAN match (L1/L2/L3)
-#   - rounding < gap <= variance_band          → paired but flagged MATCH_VARIANCE
-#   - variance_band < gap <= am_ceiling        → AMOUNT_MISMATCH (ref-matched only)
-#   - gap > am_ceiling                          → not paired (left for review/missing)
-# variance_band and am_ceiling are PERCENTAGES of the row magnitude, so a ₹500
-# charge on a ₹34k receipt (1.5%) is caught while a ₹500 gap on a ₹600 row is not.
+# Deterministic, self-proving matching (mirror-sign: a true pair satisfies
+# ours + theirs ≈ 0, so "gap" = abs(ours + theirs)). NO percentage variance band:
+#   - gap <= rounding_tolerance                          → CONFIRMED (L1/L2/L3)
+#   - exact only after adding the counterparty's own booked per-invoice TDS
+#     (ref-matched, one side carries TDS)                → CONFIRMED (MATCHED_INCL_TDS)
+#   - same ref, gap not TDS-explained, within am_ceiling → AMOUNT_MISMATCH (review)
+#   - everything else                                    → review / missing
+# A pair is NEVER auto-confirmed on a percentage guess.
 
-# Absolute rounding tolerance (currency units) for a clean match. Covers paise /
-# GST rounding; anything larger is surfaced rather than silently absorbed.
+# Absolute rounding tolerance (currency units) for a clean/exact match. Covers
+# paise / GST rounding; anything larger is surfaced, never silently absorbed.
 DEFAULT_ROUNDING_TOLERANCE = 1.00
 
-# Variance band as a fraction of the row magnitude (2%). Beyond rounding but
-# within this → MATCH_VARIANCE. User-adjustable via the UI.
-DEFAULT_VARIANCE_BAND_PCT = 0.02
-
-# Amount-mismatch ceiling as a fraction of the row magnitude (15%). A ref-matched
-# pair whose gap exceeds this is NOT paired (prevents an invoice binding to an
-# unrelated same-ref journal of wildly different value).
+# Amount-mismatch ceiling as a fraction of the row magnitude (15%): only bounds
+# which same-ref pairs are worth DISPLAYING as AMOUNT_MISMATCH — it never promotes
+# a pair to a confirmed match. A ref-matched pair whose gap exceeds this is left
+# for review/missing (prevents binding an invoice to an unrelated same-ref journal).
 DEFAULT_AM_CEILING_PCT = 0.15
 
-# Back-compat alias: the old single "amount tolerance" now maps to the variance
-# band's absolute floor (used where a percentage of a tiny amount would be < this).
+# Back-compat alias for any external caller still referencing a single tolerance.
 DEFAULT_AMOUNT_TOLERANCE = 1.00
 
 # Default date tolerance (days) for L2 timing-difference matching

@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from config import (
     MAPPABLE_FIELDS,
     DEFAULT_ROUNDING_TOLERANCE,
-    DEFAULT_VARIANCE_BAND_PCT,
+    DEFAULT_AM_CEILING_PCT,
 )
 from ingest import load_ledger, list_sheets
 from mapper import analyze_ledger, save_confirmed_analysis
@@ -575,17 +575,20 @@ elif st.session_state.step == 3:
             "Rounding tolerance (₹)",
             value=DEFAULT_ROUNDING_TOLERANCE,
             step=0.5, min_value=0.0,
-            help="Amounts within this small difference are treated as a clean match "
-                 "(covers paise / GST rounding). Anything larger is surfaced, not hidden.",
+            help="Amounts within this small difference count as an exact match "
+                 "(covers paise / GST rounding). A pair is only ever confirmed on an "
+                 "exact mirror — with or without the counterparty's booked TDS added "
+                 "back — never on a percentage guess.",
         )
     with ct2:
-        variance_band_pct = st.number_input(
-            "Variance band (%)",
-            value=DEFAULT_VARIANCE_BAND_PCT * 100.0,
-            step=0.5, min_value=0.0,
-            help="A pair whose gap is beyond rounding but within this %% of the amount "
-                 "is flagged as 'Matched with variance' (e.g. a bank charge), not lost "
-                 "in Missing. Set 0 to disable.",
+        am_ceiling_pct = st.number_input(
+            "Amount-mismatch ceiling (%)",
+            value=DEFAULT_AM_CEILING_PCT * 100.0,
+            step=1.0, min_value=0.0,
+            help="Only bounds which same-invoice pairs are worth showing as an "
+                 "Amount Mismatch for review. A ref-matched pair whose gap exceeds "
+                 "this %% of the amount is left as missing (never force-paired). "
+                 "It never promotes a pair to a confirmed match.",
         ) / 100.0
     enable_ai = st.checkbox(
         "Generate AI insights for the Summary sheet",
@@ -611,7 +614,7 @@ elif st.session_state.step == 3:
                 result = reconcile(
                     ours_std, theirs_std,
                     rounding_tolerance=rounding_tolerance,
-                    variance_band_pct=variance_band_pct,
+                    am_ceiling_pct=am_ceiling_pct,
                     opening_balance_ours=opening_ours,
                     opening_balance_theirs=opening_theirs,
                 )
@@ -681,24 +684,32 @@ elif st.session_state.step == 4:
     adj_missing_ours   = s["missing_in_ours"]   - tds_removed_ours
 
     needs_review_total = (
-        s["amount_mismatches"] + s.get("variance", 0)
+        s["amount_mismatches"] + s.get("suggested_tds_unverified", 0)
         + s.get("sign_reversed", 0) + s.get("suspected_duplicates", 0)
+    )
+    confirmed_total = (
+        s["matched_l1"] + s["matched_l2"] + s["matched_l3"] + s.get("matched_tds", 0)
     )
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("L1 Matches", s["matched_l1"], help="Date + Ref + Amount all align")
-    c2.metric("L2 Matches (Timing)", s["matched_l2"])
-    c3.metric("L3 Matches (Review)", s["matched_l3"])
+    c1.metric("Confirmed Matches", confirmed_total,
+              help="Exact mirror matches (with or without the counterparty's booked TDS added back).")
+    c2.metric("Matched incl. TDS", s.get("matched_tds", 0),
+              help="Ref-matched and exact once the counterparty's withheld TDS is added back "
+                   "(seller books gross, buyer books net + TDS).")
+    c3.metric("Exact (Date+Amount)", s["matched_l3"],
+              help="No shared ref, but an unambiguous exact mirror on date + amount (voucher-class compatible).")
     c4.metric("Needs Review", needs_review_total,
-              help="Probable pairs / anomalies to confirm — amount mismatches, variances, "
-                   "sign-reversed postings, suspected duplicates. See the Needs Review section below.")
+              help="Amount mismatches, unverifiable-TDS pairs, sign-reversed postings, suspected "
+                   "duplicates. See the Needs Review section below.")
 
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Variance (e.g. bank charge)", s.get("variance", 0))
-    c6.metric("Sign-reversed", s.get("sign_reversed", 0),
+    c5.metric("Amount Mismatches", s["amount_mismatches"])
+    c6.metric("TDS – needs verify", s.get("suggested_tds_unverified", 0),
+              help="Both sides carry TDS, so the pair cannot self-prove — verify the allocation.")
+    c7.metric("Sign-reversed", s.get("sign_reversed", 0),
               help="Same amount & date but same sign — a likely posting error (wrong column).")
-    c7.metric("Suspected Duplicates", s.get("suspected_duplicates", 0))
-    c8.metric("Amount Mismatches", s["amount_mismatches"])
+    c8.metric("Suspected Duplicates", s.get("suspected_duplicates", 0))
 
     c9, c10, c11, c12 = st.columns(4)
     c9.metric("Missing in Theirs", adj_missing_theirs,

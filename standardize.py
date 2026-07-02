@@ -88,10 +88,15 @@ def clean_date(value) -> pd.Timestamp | None:
         return pd.NaT
 
 
+# Tally XLS exports embed a literal "_x000D_" (carriage-return) artifact and
+# often trail wrapped address/notes after it. Drop it and anything after.
+_X000D_RE = re.compile(r"_x000d_.*", re.IGNORECASE | re.DOTALL)
+
+
 def clean_text(value) -> str:
     if value is None:
         return ""
-    s = str(value).strip()
+    s = _X000D_RE.sub("", str(value)).strip()
     if s.lower() in ("nan", "none"):
         return ""
     return re.sub(r"\s+", " ", s)
@@ -101,7 +106,7 @@ def clean_voucher(value) -> str:
     """Uppercase + strip separators for matching: JV-001 → JV001."""
     if value is None:
         return ""
-    s = str(value).strip().upper()
+    s = _X000D_RE.sub("", str(value)).strip().upper()
     if s.lower() in ("nan", "none", "-"):
         return ""
     return re.sub(r"[\s\-_/.]", "", s)
