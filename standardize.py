@@ -26,11 +26,21 @@ from dateutil import parser as date_parser
 
 from config import CANONICAL_FIELDS
 
-_BALANCE_WORDS = [
-    'opening balance', 'closing balance', 'grand total',
-    'account closed', 'brought forward', 'carried forward',
-    'total', 'totals', 'sub total', 'subtotal',
+# Summary / balance-carry rows to exclude from matching. These must be matched
+# PRECISELY, not as a substring anywhere in a cell — otherwise a real transaction
+# whose narration merely mentions a word (e.g. "...MACHINES TOTAL 33 REQUIRED...")
+# would be silently dropped. See _is_balance_row.
+#
+# Specific phrases: a cell that EQUALS or STARTS WITH one of these is a summary
+# row (specific enough that a real narration won't begin with them).
+_BALANCE_PHRASES = [
+    'opening balance', 'closing balance', 'opening bal', 'closing bal',
+    'grand total', 'account closed', 'brought forward', 'carried forward',
 ]
+# Ambiguous single words: matched ONLY when the whole cell IS this label (a
+# summary line that reads just "Total"/"Totals"/"Sub Total"), never as a
+# substring of a real description.
+_BALANCE_EXACT = {'total', 'totals', 'sub total', 'subtotal', 'sub-total', 'grand total'}
 
 _ISO_DATE_RE = re.compile(r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}")
 
@@ -113,10 +123,20 @@ def clean_voucher(value) -> str:
 
 
 def _is_balance_row(row: pd.Series) -> bool:
+    """True only for genuine summary / balance-carry rows. Each cell is normalized
+    (punctuation like the '*** OPENING BALANCE ***' stars -> spaces) and then
+    matched by EQUALITY or a specific STARTS-WITH — never by substring-anywhere,
+    so a real transaction that merely mentions 'total' in its narration is kept."""
     for v in row:
-        s = str(v).strip().lower()
-        if any(bw in s for bw in _BALANCE_WORDS):
+        c = re.sub(r"[^a-z0-9 ]+", " ", str(v).lower())
+        c = re.sub(r"\s+", " ", c).strip()
+        if not c:
+            continue
+        if c in _BALANCE_EXACT:
             return True
+        for p in _BALANCE_PHRASES:
+            if c == p or c.startswith(p + " "):
+                return True
     return False
 
 

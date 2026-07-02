@@ -143,6 +143,7 @@ def main():
     test_no_ref_and_anomalies()
     test_tds_reclassification()
     test_invoice_ref_fallback()
+    test_summary_row_filter()
 
     print("\n" + "=" * 70)
     if _failures:
@@ -340,6 +341,36 @@ def test_invoice_ref_fallback():
     r = reconcile(o, t)
     check("REF: shared voucher no (no explicit ref) still L1-matches", r.summary["matched_l1"] == 1,
           f"{r.summary['matched_l1']}")
+
+
+def test_summary_row_filter():
+    print("\n[9/9] Summary-row filter must NOT drop real transactions...")
+    # Regression: a genuine credit note whose narration merely MENTIONS "total"
+    # ("...MACHINES TOTAL 33 REQUIRED...") was being silently dropped because
+    # 'total' was matched as a substring anywhere in a cell. It must be KEPT;
+    # only true summary lines (exactly "TOTALS"/"Grand Total"/"Opening Balance")
+    # and a vendor name containing "Total" must behave correctly.
+    raw = pd.DataFrame([
+        ["2026-03-05", "Credit Note", "CN-1", "25-26/CN-014",
+         "TP CSMS ADDL MACHINES TOTAL 33 REQUIRED GST Vr. Receipts/ P.Return", "0", "804465", "0"],  # KEEP
+        ["2026-03-06", "Sales", "SV-2", "INV-2", "Total Solutions Pvt Ltd - annual fee", "5000", "0", "0"],  # KEEP (vendor name)
+        ["2026-03-07", "Sales", "SV-3", "INV-3", "Sub Total of prior lines", "1234", "0", "0"],  # KEEP (mentions sub total)
+        ["", "", "", "", "TOTALS", "9999", "0", "0"],                       # DROP (exact summary)
+        ["", "", "", "", "Grand Total", "8888", "0", "0"],                  # DROP
+        ["", "", "", "", "*** OPENING BALANCE ***", "7777", "0", "0"],      # DROP
+        ["", "", "", "", "Closing Balance", "6666", "0", "0"],              # DROP
+    ], columns=_COLS)
+    std = standardize(raw, _MAP)
+    kept = set(std["Invoice Ref"])
+    check("SUMMARY: credit note with 'TOTAL' in narration is KEPT",
+          "2526CN014" in kept, f"kept refs={kept}")
+    check("SUMMARY: 804465 amount survives standardize",
+          bool((std["Gross Amount"].abs() == 804465).any()),
+          f"grosses={std['Gross Amount'].tolist()}")
+    check("SUMMARY: vendor name 'Total Solutions...' row KEPT", "INV2" in kept, f"{kept}")
+    check("SUMMARY: 'Sub Total of prior lines' narration row KEPT", "INV3" in kept, f"{kept}")
+    check("SUMMARY: genuine summary rows dropped (3 real txns kept of 7)",
+          len(std) == 3, f"got {len(std)} rows: {std['Description'].tolist()}")
 
 
 if __name__ == "__main__":
